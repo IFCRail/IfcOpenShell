@@ -1,23 +1,23 @@
 use_step_matcher("parse")
-from bimtester.features.steps.classification import en
+from steps.classification import en
 
 use_step_matcher("parse")
-from bimtester.features.steps.element_classes import en
+from steps.element_classes import en
 
 use_step_matcher("parse")
-from bimtester.features.steps.geocoding import en
+from steps.geocoding import en
 
 use_step_matcher("parse")
-from bimtester.features.steps.geolocation import en
+from steps.geolocation import en
 
 use_step_matcher("parse")
-from bimtester.features.steps.geometric_detail import en
+from steps.geometric_detail import en
 
 use_step_matcher("parse")
-from bimtester.features.steps.model_federation import en
+from steps.model_federation import en
 
 use_step_matcher("parse")
-from bimtester.features.steps.project_setup import de, en, fr, it, nl
+from steps.project_setup import de, en, fr, it, nl
 
 use_step_matcher("parse")
-from bimtester.features.steps.aggregation import en
+from steps.aggregation import en
