@@ -21,8 +21,8 @@ from PySide2.QtWidgets import (
     QCheckBox,
 )
 
-DEFAULT_IFC_FILE_PATH = "IFC files from implementers/MyVendor/Deviatoio_Struttura Test.ifc"
-DEFAULT_FEATURES_PATH = "Features/UT_0_Deviatoio.feature"
+DEFAULT_IFC_FILE_PATH = "IFC files from implementers"
+DEFAULT_FEATURES_PATH = "Features"
 DEFAULT_REPORTS_PATH = "Validation reports"
 
 # Option widget
