@@ -14,14 +14,14 @@ class ReportGenerator:
         except Exception:
             self.base_path = os.path.dirname(os.path.realpath(__file__))
 
-    def generate(self, report_json, output_file):
+    def generate(self, report_json, output_file, meta_data=None):
         print("# Generating HTML reports.")
 
         report = json.loads(open(report_json).read())
         for feature in report:
-            self.generate_feature_report(feature, output_file)
+            self.generate_feature_report(feature, output_file, meta_data)
 
-    def generate_feature_report(self, feature, output_file):
+    def generate_feature_report(self, feature, output_file, meta_data=None):
         file_name = os.path.basename(feature["location"]).split(":")[0]
         data = {
             "file_name": file_name,
@@ -31,6 +31,9 @@ class ReportGenerator:
             "is_success": feature["status"] == "passed",
             "scenarios": [],
         }
+
+        if meta_data:
+            data["meta_data"] = meta_data
 
         if "elements" not in feature:
             if "status" in feature and feature["status"] == "skipped":
@@ -109,6 +112,9 @@ class ReportGenerator:
             "is_skipped": step["result"]["status"] == "skipped",
             "error_message": None if step["result"]["status"] == "passed" else step["result"]["error_message"],
         }
+
+        if step["keyword"] == "Given":
+            data["keyword"] = step["keyword"]
 
         # Remove the first "Assertion Failed" message
         if isinstance(data["error_message"], list) and data["error_message"]:

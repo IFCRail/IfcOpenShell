@@ -50,7 +50,15 @@ class BIMTesterWrapper:
 
         # create html report
         print("BIMTester: Generating reports...")
-        bimtester.reports.ReportGenerator().generate(report_json, report_full_path)
+        # resolve meta data
+        topic_path, ut_id = os.path.split(path)
+        topic_path, topic_title = os.path.split(topic_path)
+        meta_data = {
+            "topic_title": topic_title,
+            "ut_id": ut_id,
+            "ifc_file_name": os.path.basename(ifc_file),
+        }
+        bimtester.reports.ReportGenerator().generate(report_json, report_full_path, meta_data)
 
         # get the report files
         report_files = []
