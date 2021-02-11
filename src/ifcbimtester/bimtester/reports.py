@@ -18,6 +18,9 @@ class ReportGenerator:
         print("# Generating HTML reports.")
 
         report = json.loads(open(report_json).read())
+
+        if output_file.endswith(".html"):
+            output_file = os.path.splitext(output_file)[0]
         for feature in report:
             self.generate_feature_report(feature, output_file, meta_data)
 
@@ -54,11 +57,12 @@ class ReportGenerator:
 
         data.update(self.get_template_strings())
 
-        with open(output_file, "w", encoding="utf8") as out:
-            with open(
-                os.path.join(self.base_path, "resources", "reports", "template.html"), encoding="utf8"
-            ) as template:
-                out.write(pystache.render(template.read(), data))
+        for ext in ["html"]:
+            with open(output_file + "." + ext, "w", encoding="utf8") as out:
+                with open(
+                    os.path.join(self.base_path, "resources", "reports", "template." + ext), encoding="utf8"
+                ) as template:
+                    out.write(pystache.render(template.read(), data))
 
     def process_scenario(self, scenario):
         if len(scenario["steps"]) == 0:

@@ -35,20 +35,20 @@
         <h1>Unit Test validation report - {{name}}</h1>
     </header>
     <dl class="dl-horizontal">
-        {{#topic_title}}
+        {{#meta_data.topic_title}}
         <dt>Topic title</dt>
         <dd>{{.}}</dd>
-        {{/topic_title}}
-        {{#ut_id}}
+        {{/meta_data.topic_title}}
+        {{#meta_data.ut_id}}
         <dt>Unit Test ID</dt>
         <dd>{{.}}</dd>
-        {{/ut_id}}
-        {{#ifc_file_name}}
+        {{/meta_data.ut_id}}
+        {{#meta_data.ifc_file_name}}
         <dt>Report ID</dt>
-        <dd>{{ifc_file_name}}.{{file_name}}</dd>
+        <dd>{{.}}.{{file_name}}.html</dd>
         <dt>IFC file name</dt>
-        <dd>{{ifc_file_name}}</dd>
-        {{/ifc_file_name}}
+        <dd>{{.}}</dd>
+        {{/meta_data.ifc_file_name}}
         <dt>Feature file name</dt>
         <dd>{{file_name}}</dd>
         <dt>Execution date</dt>
