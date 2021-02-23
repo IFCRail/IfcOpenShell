@@ -21,7 +21,8 @@ def validate(ifc):
             for statement in logger.statements:
                 errors.append(f"{json.dumps(statement, default=str)}")
     except RuntimeError as error:
-        assert False, str(error)
+        errors.append(str(error))
+    return errors
 
 
 def assert_guid(ifc, guid):
