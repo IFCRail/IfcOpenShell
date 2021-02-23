@@ -27,7 +27,7 @@
 #ifndef IFCPARSE_H
 #define IFCPARSE_H
 
-#define IFCOPENSHELL_VERSION "0.5.0-rc1"
+#define IFCOPENSHELL_VERSION "0.6.0b0"
 
 #include <string>
 #include <sstream>
@@ -47,13 +47,19 @@
 #include "../ifcparse/IfcLogger.h"
 #include "../ifcparse/Argument.h"
 
-#ifdef USE_IFC4
-#include "../ifcparse/Ifc4.h"
-#else
-#include "../ifcparse/Ifc2x3.h"
-#endif
-
 #include "../ifcparse/IfcSpfStream.h"
+
+#if defined(__clang__)
+# define my_thread_local thread_local
+#elif defined(__GNUC__)
+# define my_thread_local __thread
+#elif __STDC_VERSION__ >= 201112L
+# define my_thread_local _Thread_local
+#elif defined(_MSC_VER)
+# define my_thread_local __declspec(thread)
+#else
+# error Cannot define thread_local
+#endif
 
 namespace IfcParse {
 
@@ -147,12 +153,13 @@ namespace IfcParse {
 	class IFC_PARSE_API IfcSpfLexer {
 	private:
 		IfcCharacterDecoder* decoder;
-		//storage for temporary string without allocation
-		mutable std::string _tempString;
 		unsigned int skipWhitespace();
 		unsigned int skipComment();
 	public:
-		std::string &GetTempString() const { return _tempString; }
+		std::string &GetTempString() const { 
+			static my_thread_local std::string s;
+			return s;
+		}
 		IfcSpfStream* stream;
 		IfcFile* file;
 		IfcSpfLexer(IfcSpfStream* s, IfcFile* f);
@@ -166,9 +173,12 @@ namespace IfcParse {
 	///                 ==========
 	class IFC_PARSE_API ArgumentList: public Argument {
 	private:
-		std::vector<Argument*> list;
-		void push(Argument* l);
+		size_t size_;
+		Argument** list_;
+
 	public:
+		ArgumentList() : size_(0), list_(0) {}
+		ArgumentList(size_t n) : size_(n), list_(new Argument*[size_]) {}
 		~ArgumentList();
 
 		void read(IfcSpfLexer* t, std::vector<unsigned int>& ids);
@@ -189,11 +199,11 @@ namespace IfcParse {
 		unsigned int size() const;
 
 		Argument* operator [] (unsigned int i) const;
-		void set(unsigned int i, Argument*);
 
 		std::string toString(bool upper=false) const;
 
-		std::vector<Argument*>& arguments() { return list; }
+		Argument**& arguments() { return list_; }
+		size_t& size() { return size_; }
 	};
 
 

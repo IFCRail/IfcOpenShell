@@ -97,14 +97,10 @@
 
 #include "../ifcgeom/IfcGeom.h"
 
-namespace {
-	// Returns the other vertex of an edge
-	TopoDS_Vertex other(const TopoDS_Edge& e, const TopoDS_Vertex& v) {
-		TopoDS_Vertex a, b;
-		TopExp::Vertices(e, a, b);
-		return v.IsSame(b) ? a : b;
-	}
+#define Kernel MAKE_TYPE_NAME(Kernel)
 
+namespace {
+	// Returns the first edge of a wire
 	TopoDS_Edge first_edge(const TopoDS_Wire& w) {
 		TopoDS_Vertex v1, v2;
 		TopExp::Vertices(w, v1, v2);
@@ -219,7 +215,7 @@ namespace {
 			if (dist > 1000. * p_) {
 				mw_.Add(w1);
 				mw_.Add(BRepBuilderAPI_MakeEdge(p1, p2));
-				Logger::Message(Logger::LOG_ERROR, "Added additional segment to close gap with length " + boost::lexical_cast<std::string>(dist) + " to:", inst_->entity);
+				Logger::Warning("Added additional segment to close gap with length " + boost::lexical_cast<std::string>(dist) + " to:", inst_);
 				goto check;
 			}
 
@@ -247,29 +243,29 @@ namespace {
 					// Preferably adjust the segment that is linear
 					if (is_line1 || (is_circle1 && !is_line2)) {
 						mw_.Add(adjust(w1, w12, p2));
-						Logger::Message(Logger::LOG_ERROR, "Adjusted edge end-point with distance " + boost::lexical_cast<std::string>(dist) + " on:", inst_->entity);
+						Logger::Notice("Adjusted edge end-point with distance " + boost::lexical_cast<std::string>(dist) + " on:", inst_);
 					} else if ((is_line2 || is_circle2) && !last) {
 						mw_.Add(w1);
 						override_next_ = true;
 						next_override_ = p1;
-						Logger::Message(Logger::LOG_ERROR, "Adjusted edge end-point with distance " + boost::lexical_cast<std::string>(dist) + " on:", inst_->entity);
+						Logger::Notice("Adjusted edge end-point with distance " + boost::lexical_cast<std::string>(dist) + " on:", inst_);
 					} else {
 						// In all other cases an edge is added
 						mw_.Add(w1);
 						mw_.Add(BRepBuilderAPI_MakeEdge(p1, p2));
-						Logger::Message(Logger::LOG_ERROR, "Added additional segment to close gap with length " + boost::lexical_cast<std::string>(dist) + " to:", inst_->entity);
+						Logger::Warning("Added additional segment to close gap with length " + boost::lexical_cast<std::string>(dist) + " to:", inst_);
 					}
 				} else {
-					Logger::Error("Internal error, inconsistent wire segments", inst_->entity);
+					Logger::Error("Internal error, inconsistent wire segments", inst_);
 					mw_.Add(w1);
 				}
 			}
 
 		check:
 			if (mw_.Error() == BRepBuilderAPI_NonManifoldWire) {
-				Logger::Error("Non-manifold curve segments:", inst_->entity);
+				Logger::Error("Non-manifold curve segments:", inst_);
 			} else if (mw_.Error() == BRepBuilderAPI_DisconnectedWire) {
-				Logger::Error("Failed to join curve segments:", inst_->entity);
+				Logger::Error("Failed to join curve segments:", inst_);
 			}
 		}
 
@@ -299,7 +295,7 @@ namespace {
 
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcCompositeCurve* l, TopoDS_Wire& wire) {
 	if ( getValue(GV_PLANEANGLE_UNIT)<0 ) {
-		Logger::Message(Logger::LOG_WARNING,"Creating a composite curve without unit information:",l->entity);
+		Logger::Message(Logger::LOG_WARNING,"Creating a composite curve without unit information:",l);
 
 		// Temporarily pretend we do have unit information
 		setValue(GV_PLANEANGLE_UNIT,1.0);
@@ -374,22 +370,52 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcCompositeCurve* l, TopoDS_Wire
 		return use_radians || use_degrees;
 	}
 
-	
+#ifdef SCHEMA_HAS_IfcSegment
+	// 4x3
+	IfcSchema::IfcSegment::list::ptr segments = l->Segments();
+#else
 	IfcSchema::IfcCompositeCurveSegment::list::ptr segments = l->Segments();
+#endif
 
 	TopTools_ListOfShape converted_segments;
 	
-	for (IfcSchema::IfcCompositeCurveSegment::list::it it = segments->begin(); it != segments->end(); ++it) {
+	for (auto it = segments->begin(); it != segments->end(); ++it) {
 
-		IfcSchema::IfcCurve* curve = (*it)->ParentCurve();
+		if (!(*it)->declaration().is(IfcSchema::IfcCompositeCurveSegment::Class())) {
+			Logger::Error("Not implemented", *it);
+			return false;
+		}
+
+		IfcSchema::IfcCurve* curve = ((IfcSchema::IfcCompositeCurveSegment*)(*it))->ParentCurve();
+
+		// The type of ParentCurve is IfcCurve, but the documentation says:
+		// ParentCurve: The *bounded curve* which defines the geometry of the segment. 
+		// At least let's exclude IfcLine as an infinite linear segment
+		// definitely does not make any sense.
 		TopoDS_Wire segment;
 
-		if (!convert_wire(curve, segment)) {
-			Logger::Message(Logger::LOG_ERROR, "Failed to convert curve:", curve->entity);
+		if (curve->as<IfcSchema::IfcLine>()) {
+			Logger::Notice("Infinite IfcLine used as ParentCurve of segment, treating as a segment", *it);
+			Handle_Geom_Curve handle;
+			convert_curve(curve, handle);
+			double u0 = 0.0;
+			double u1 = curve->as<IfcSchema::IfcLine>()->Dir()->Magnitude() * getValue(GV_LENGTH_UNIT);
+			if (u1 < getValue(GV_PRECISION)) {
+				Logger::Warning("Segment length below tolerance", *it);
+			}
+			BRepBuilderAPI_MakeEdge me(handle, u0, u1);
+			if (me.IsDone()) {
+				BRep_Builder B;
+				B.MakeWire(segment);
+				B.Add(segment, me.Edge());
+			}
+		} else if (!convert_wire(curve, segment)) {
+			const bool failed_on_purpose = curve->as<IfcSchema::IfcPolyline>() && !segment.IsNull();
+			Logger::Message(failed_on_purpose ? Logger::LOG_WARNING : Logger::LOG_ERROR, "Failed to convert curve:", curve);
 			continue;
 		}
 
-		if (!(*it)->SameSense()) {
+		if (!((IfcSchema::IfcCompositeCurveSegment*)(*it))->SameSense()) {
 			segment.Reverse();
 		}
 
@@ -401,7 +427,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcCompositeCurve* l, TopoDS_Wire
 	}
 
 	if (converted_segments.Extent() == 0) {
-		Logger::Message(Logger::LOG_ERROR, "No segment succesfully converted:", l->entity);
+		Logger::Message(Logger::LOG_ERROR, "No segment succesfully converted:", l);
 		return false;
 	}
 
@@ -410,7 +436,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcCompositeCurve* l, TopoDS_Wire
 
 	TopTools_ListIteratorOfListOfShape it(converted_segments);
 
-	IfcEntityList::ptr profile = l->entity->getInverse(IfcSchema::Type::IfcProfileDef, -1);
+	IfcEntityList::ptr profile = l->data().getInverse(&IfcSchema::IfcProfileDef::Class(), -1);
 	const bool force_close = profile && profile->size() > 0;
 
 	wire_builder bld(getValue(GV_PRECISION), l);
@@ -447,14 +473,14 @@ namespace {
 
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& wire) {
 	IfcSchema::IfcCurve* basis_curve = l->BasisCurve();
-	bool isConic = basis_curve->is(IfcSchema::Type::IfcConic);
+	bool isConic = basis_curve->declaration().is(IfcSchema::IfcConic::Class());
 	double parameterFactor = isConic ? getValue(GV_PLANEANGLE_UNIT) : getValue(GV_LENGTH_UNIT);
 	
 	Handle(Geom_Curve) curve;
 	if (shape_type(basis_curve) == ST_CURVE) {
 		if (!convert_curve(basis_curve, curve)) return false;
 	} else if (shape_type(basis_curve) == ST_WIRE) {
-		Logger::Warning("Approximating BasisCurve due to possible discontinuities", l->entity);
+		Logger::Warning("Approximating BasisCurve due to possible discontinuities", l);
 		TopoDS_Wire w;
 		if (!convert_wire(basis_curve, w)) return false;
 		BRepAdaptor_CompCurve cc(w, true);
@@ -463,7 +489,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& 
 		Approx_Curve3d approx(hcc, getValue(GV_PRECISION), GeomAbs_C0, 10, 10);
 		curve = approx.Curve();
 	} else {
-		Logger::Error("Unknown BasisCurve", l->entity);
+		Logger::Error("Unknown BasisCurve", l);
 		return false;
 	}
 	
@@ -481,10 +507,10 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& 
 
 	for ( IfcEntityList::it it = trims1->begin(); it != trims1->end(); it ++ ) {
 		IfcUtil::IfcBaseClass* i = *it;
-		if ( i->is(IfcSchema::Type::IfcCartesianPoint) ) {
+		if ( i->declaration().is(IfcSchema::IfcCartesianPoint::Class()) ) {
 			IfcGeom::Kernel::convert((IfcSchema::IfcCartesianPoint*)i, pnts[sense_agreement] );
 			has_pnts[sense_agreement] = true;
-		} else if ( i->is(IfcSchema::Type::IfcParameterValue) ) {
+		} else if ( i->declaration().is(IfcSchema::IfcParameterValue::Class()) ) {
 			const double value = *((IfcSchema::IfcParameterValue*)i);
 			flts[sense_agreement] = value * parameterFactor;
 			has_flts[sense_agreement] = true;
@@ -493,10 +519,10 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& 
 
 	for ( IfcEntityList::it it = trims2->begin(); it != trims2->end(); it ++ ) {
 		IfcUtil::IfcBaseClass* i = *it;
-		if ( i->is(IfcSchema::Type::IfcCartesianPoint) ) {
+		if ( i->declaration().is(IfcSchema::IfcCartesianPoint::Class()) ) {
 			IfcGeom::Kernel::convert((IfcSchema::IfcCartesianPoint*)i, pnts[1-sense_agreement] );
 			has_pnts[1-sense_agreement] = true;
-		} else if ( i->is(IfcSchema::Type::IfcParameterValue) ) {
+		} else if ( i->declaration().is(IfcSchema::IfcParameterValue::Class()) ) {
 			const double value = *((IfcSchema::IfcParameterValue*)i);
 			flts[1-sense_agreement] = value * parameterFactor;
 			has_flts[1-sense_agreement] = true;
@@ -507,7 +533,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& 
 	bool trim_cartesian_failed = !trim_cartesian;
 	if ( trim_cartesian ) {
 		if ( pnts[0].Distance(pnts[1]) < 2 * getValue(GV_PRECISION) ) {
-			Logger::Message(Logger::LOG_WARNING,"Skipping segment with length below tolerance level:",l->entity);
+			Logger::Message(Logger::LOG_WARNING,"Skipping segment with length below tolerance level:",l);
 			return false;
 		}
 		ShapeFix_ShapeTolerance FTol;
@@ -519,11 +545,19 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& 
 		if (!me.IsDone()) {
 			BRepBuilderAPI_EdgeError err = me.Error();
 			if ( err == BRepBuilderAPI_PointProjectionFailed ) {
-				Logger::Message(Logger::LOG_WARNING,"Point projection failed for:",l->entity);
+				Logger::Message(Logger::LOG_WARNING,"Point projection failed for:",l);
 				trim_cartesian_failed = true;
 			}
 		} else {
 			e = me.Edge();
+			// BRepBuilderAPI_MakeEdge swaps v1 and v2 if the parameter value of v2 is 
+			// smaller than that of v1. In that case the edge has to be reversed so that
+			// the vertex order is consistent with Trim1 and Trim2. Otherwise the
+			// IfcOpenShell wire builder will create intermediate edges automatically.
+			// The alternative would be to reverse the underlying curve instead.
+			if (!TopExp::FirstVertex(e, true).IsSame(v1)) {
+				e.Reverse();
+			}
 		}
 	}
 
@@ -532,12 +566,12 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& 
 		// is defined by an IfcCartesianPoint and an IfcVector with Magnitude. Because
 		// the vector is normalised when passed to Geom_Line constructor the magnitude
 		// needs to be factored in with the IfcParameterValue here.
-		if ( basis_curve->is(IfcSchema::Type::IfcLine) ) {
+		if ( basis_curve->declaration().is(IfcSchema::IfcLine::Class()) ) {
 			IfcSchema::IfcLine* line = static_cast<IfcSchema::IfcLine*>(basis_curve);
 			const double magnitude = line->Dir()->Magnitude();
 			flts[0] *= magnitude; flts[1] *= magnitude;
 		}
-		if ( basis_curve->is(IfcSchema::Type::IfcEllipse) ) {
+		if ( basis_curve->declaration().is(IfcSchema::IfcEllipse::Class()) ) {
 			IfcSchema::IfcEllipse* ellipse = static_cast<IfcSchema::IfcEllipse*>(basis_curve);
 			double x = ellipse->SemiAxis1() * getValue(GV_LENGTH_UNIT);
 			double y = ellipse->SemiAxis2() * getValue(GV_LENGTH_UNIT);
@@ -547,14 +581,53 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& 
 				flts[1] -= M_PI / 2.;
 			}
 		}
-		if ( isConic && ALMOST_THE_SAME(fmod(flts[1]-flts[0],M_PI*2.),0.) ) {
+
+		double radius = 1.0;
+		if (curve->DynamicType() == STANDARD_TYPE(Geom_Circle)) {
+			auto circle_curve = Handle_Geom_Circle::DownCast(curve);
+			radius = circle_curve->Radius();
+		} else if (curve->DynamicType() == STANDARD_TYPE(Geom_Ellipse)) {
+			auto circle_curve = Handle_Geom_Ellipse::DownCast(curve);
+			radius = (circle_curve->MajorRadius() + circle_curve->MinorRadius()) / 2.;
+		}
+
+		// Fix from @sanderboer to compare using model tolerance, see #744
+		// Made dependent on radius, see #928
+
+		// A good critereon for determining whether to take full curve
+		// or trimmed segment would be whether there are other curve segments or this
+		// is the only one.
+		boost::optional<size_t> num_segments;
+		auto segment = l->data().getInverse(&IfcSchema::IfcCompositeCurveSegment::Class(), -1);
+		if (segment->size() == 1) {
+			auto comp = (*segment->begin())->data().getInverse(&IfcSchema::IfcCompositeCurve::Class(), -1);
+			if (comp->size() == 1) {
+				num_segments = (*comp->begin())->as<IfcSchema::IfcCompositeCurve>()->Segments()->size();
+			}
+		}
+
+		if (isConic && ALMOST_THE_SAME(fmod(flts[1]-flts[0],M_PI*2.), 0., 100 * getValue(GV_PRECISION) / (2 * M_PI * radius))) {
 			e = BRepBuilderAPI_MakeEdge(curve).Edge();
 		} else {
 			BRepBuilderAPI_MakeEdge me (curve,flts[0],flts[1]);
 			e = me.Edge();
-		}			
+		}
+
+		if (num_segments && *num_segments > 1) {
+			TopoDS_Vertex v0, v1;
+			TopExp::Vertices(e, v0, v1);
+			if (v0.IsSame(v1)) {
+				Logger::Warning("Skipping degenerate segment", l);
+				return false;
+			}
+		}
+
 	} else if ( trim_cartesian_failed && (has_pnts[0] && has_pnts[1]) ) {
 		e = BRepBuilderAPI_MakeEdge(pnts[0], pnts[1]).Edge();
+	}
+
+	if (e.IsNull()) {
+		return false;
 	}
 
 	if (isConic) {
@@ -566,14 +639,14 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrimmedCurve* l, TopoDS_Wire& 
 		if (crv->DynamicType() == STANDARD_TYPE(Geom_Circle)) {
 			radius = Handle(Geom_Circle)::DownCast(crv)->Radius();
 		} else if (crv->DynamicType() == STANDARD_TYPE(Geom_Ellipse)) {
-			// The formula above is for circles, but probably good enough
+			// The formula in deflection_for_approximating_circle() is for circles, but probably good enough
 			radius = Handle(Geom_Ellipse)::DownCast(crv)->MajorRadius();
 		}
-		if (radius > 0. && deflection_for_approximating_circle(radius, b - a) < getValue(GV_PRECISION)) {
+		if (radius > 0. && deflection_for_approximating_circle(radius, b - a) < 100 * getValue(GV_PRECISION) && std::abs(b-a) < M_PI/4.) {
 			TopoDS_Vertex v0, v1;
 			TopExp::Vertices(e, v0, v1);
 			e = TopoDS::Edge(BRepBuilderAPI_MakeEdge(v0, v1).Edge().Oriented(e.Orientation()));
-			Logger::Warning("Subsituted edge with linear approximation", l->entity);
+			Logger::Warning("Subsituted edge with linear approximation", l);
 		}
 	}
 
@@ -619,6 +692,9 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcPolyline* l, TopoDS_Wire& resu
 	remove_duplicate_points_from_loop(polygon, closed_by_proximity, eps);
 
 	if (polygon.Length() < 2) {
+		// We somehow need to signal we fail this curve on purpose not to trigger an error.
+		BRep_Builder B;
+		B.MakeWire(result);
 		return false;
 	}
 	
@@ -649,7 +725,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcPolyLoop* l, TopoDS_Wire& resu
 	// A loop should consist of at least three vertices
 	int original_count = polygon.Length();
 	if (original_count < 3) {
-		Logger::Message(Logger::LOG_ERROR, "Not enough edges for:", l->entity);
+		Logger::Message(Logger::LOG_ERROR, "Not enough edges for:", l);
 		return false;
 	}
 
@@ -660,11 +736,11 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcPolyLoop* l, TopoDS_Wire& resu
 	int count = polygon.Length();
 	if (original_count - count != 0) {
 		std::stringstream ss; ss << (original_count - count) << " edges removed for:"; 
-		Logger::Message(Logger::LOG_WARNING, ss.str(), l->entity);
+		Logger::Message(Logger::LOG_WARNING, ss.str(), l);
 	}
 
 	if (count < 3) {
-		Logger::Message(Logger::LOG_ERROR, "Not enough edges for:", l->entity);
+		Logger::Message(Logger::LOG_ERROR, "Not enough edges for:", l);
 		return false;
 	}
 
@@ -678,7 +754,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcPolyLoop* l, TopoDS_Wire& resu
 
 	TopTools_ListOfShape results;
 	if (wire_intersections(result, results)) {
-		Logger::Error("Self-intersections with " + boost::lexical_cast<std::string>(results.Extent()) + " cycles detected", l->entity);
+		Logger::Error("Self-intersections with " + boost::lexical_cast<std::string>(results.Extent()) + " cycles detected", l);
 		select_largest(results, result);
 	}
 
@@ -689,11 +765,65 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcArbitraryOpenProfileDef* l, To
 	return convert_wire(l->Curve(), result);
 }
 
+#include <Extrema_ExtPC.hxx>
+
+namespace {
+	bool create_edge_over_curve_with_log_messages(const Handle_Geom_Curve& crv, const double eps, const gp_Pnt& p1, const gp_Pnt& p2, TopoDS_Edge& result) {
+		if (crv->IsClosed() && p1.Distance(p2) <= eps) {
+			BRepBuilderAPI_MakeEdge me(crv);
+			if (me.IsDone()) {
+				result = me.Edge();
+				return true;
+			} else {
+				return false;
+			}
+		}
+
+		BRep_Builder builder;
+		TopoDS_Vertex v1, v2;
+		/// @todo project first and emit warnings accordingly
+		builder.MakeVertex(v1, p1, eps);
+		builder.MakeVertex(v2, p2, eps);
+
+		BRepBuilderAPI_MakeEdge me(crv, v1, v2);
+		if (!me.IsDone()) {
+			const double eps2 = eps * eps;
+			if (me.Error() == BRepBuilderAPI_PointProjectionFailed) {
+				GeomAdaptor_Curve GAC(crv);
+				const gp_Pnt* ps[2] = { &p1, &p2 };
+				for (int i = 0; i < 2; ++i) {
+					Extrema_ExtPC extrema(*ps[i], GAC);
+					if (extrema.IsDone()) {
+						int n = extrema.NbExt();
+						double dmin = std::numeric_limits<double>::infinity();
+						for (int j = 1; j <= n; j++) {
+							const double d = extrema.SquareDistance(j);
+							if (d < dmin) {
+								dmin = d;
+							}
+						}
+						if (dmin == std::numeric_limits<double>::infinity()) {
+							Logger::Error("No extrema for point");
+						} else if (dmin > eps2) {
+							Logger::Error("Distance of " + boost::lexical_cast<std::string>(std::sqrt(dmin)) + " exceeds tolerance");
+						}
+					} else {
+						Logger::Error("Failed to calculate extrema for point");
+					}
+				}
+			}
+			return false;
+		}
+		result = me.Edge();
+		return true;
+	}
+}
+
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcEdgeCurve* l, TopoDS_Wire& result) {
 	IfcSchema::IfcPoint* pnt1 = ((IfcSchema::IfcVertexPoint*) l->EdgeStart())->VertexGeometry();
 	IfcSchema::IfcPoint* pnt2 = ((IfcSchema::IfcVertexPoint*) l->EdgeEnd())->VertexGeometry();
-	if (!pnt1->is(IfcSchema::Type::IfcCartesianPoint) || !pnt2->is(IfcSchema::Type::IfcCartesianPoint)) {
-		Logger::Message(Logger::LOG_ERROR, "Only IfcCartesianPoints are supported for VertexGeometry", l->entity);
+	if (!pnt1->declaration().is(IfcSchema::IfcCartesianPoint::Class()) || !pnt2->declaration().is(IfcSchema::IfcCartesianPoint::Class())) {
+		Logger::Message(Logger::LOG_ERROR, "Only IfcCartesianPoints are supported for VertexGeometry", l);
 		return false;
 	}
 	
@@ -712,16 +842,17 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcEdgeCurve* l, TopoDS_Wire& res
 	// assumed that a topological wire can be crafted from it. After which an
 	// attempt is made to reconstruct it from the individual curves and the vertices
 	// of the IfcEdgeCurve.
-	const bool is_bounded = l->EdgeGeometry()->is(IfcSchema::Type::IfcBoundedCurve);
+	const bool is_bounded = l->EdgeGeometry()->declaration().is(IfcSchema::IfcBoundedCurve::Class());
 
 	if (!is_bounded && convert_curve(l->EdgeGeometry(), crv)) {
-		BRepBuilderAPI_MakeEdge me(crv, p1, p2);
-		if (!me.IsDone()) {
+		TopoDS_Edge e;
+		if (create_edge_over_curve_with_log_messages(crv, getValue(GV_PRECISION), p1, p2, e)) {
+			mw.Add(e);
+			result = mw;
+			return true;
+		} else {
 			return false;
 		}
-		mw.Add(me.Edge());
-		result = mw;
-		return true;
 	} else if (is_bounded && convert_wire(l->EdgeGeometry(), result)) {
 		if (!l->SameSense()) {
 			result.Reverse();
@@ -758,13 +889,12 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcEdgeCurve* l, TopoDS_Wire& res
 				continue;
 			}
 
-			BRep_Builder builder;
-			TopoDS_Vertex v1, v2;
-			/// @todo project first and emit warnings accordingly
-			builder.MakeVertex(v1, a, getValue(GV_PRECISION));
-			builder.MakeVertex(v2, b, getValue(GV_PRECISION));
-
-			mw.Add(BRepBuilderAPI_MakeEdge(ecrv, v1, v2));
+			TopoDS_Edge e;
+			if (create_edge_over_curve_with_log_messages(ecrv, getValue(GV_PRECISION), a, b, e)) {
+				mw.Add(e);
+			} else {
+				return false;
+			}
 
 			first = false;
 		}
@@ -792,15 +922,15 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcEdgeLoop* l, TopoDS_Wire& resu
 }
 
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcEdge* l, TopoDS_Wire& result) {
-	if (!l->EdgeStart()->is(IfcSchema::Type::IfcVertexPoint) || !l->EdgeEnd()->is(IfcSchema::Type::IfcVertexPoint)) {
-		Logger::Message(Logger::LOG_ERROR, "Only IfcVertexPoints are supported for EdgeStart and -End", l->entity);
+	if (!l->EdgeStart()->declaration().is(IfcSchema::IfcVertexPoint::Class()) || !l->EdgeEnd()->declaration().is(IfcSchema::IfcVertexPoint::Class())) {
+		Logger::Message(Logger::LOG_ERROR, "Only IfcVertexPoints are supported for EdgeStart and -End", l);
 		return false;
 	}
 
 	IfcSchema::IfcPoint* pnt1 = ((IfcSchema::IfcVertexPoint*) l->EdgeStart())->VertexGeometry();
 	IfcSchema::IfcPoint* pnt2 = ((IfcSchema::IfcVertexPoint*) l->EdgeEnd())->VertexGeometry();
-	if (!pnt1->is(IfcSchema::Type::IfcCartesianPoint) || !pnt2->is(IfcSchema::Type::IfcCartesianPoint)) {
-		Logger::Message(Logger::LOG_ERROR, "Only IfcCartesianPoints are supported for VertexGeometry", l->entity);
+	if (!pnt1->declaration().is(IfcSchema::IfcCartesianPoint::Class()) || !pnt2->declaration().is(IfcSchema::IfcCartesianPoint::Class())) {
+		Logger::Message(Logger::LOG_ERROR, "Only IfcCartesianPoints are supported for VertexGeometry", l);
 		return false;
 	}
 	
@@ -847,7 +977,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcSubedge* l, TopoDS_Wire& resul
 	}
 }
 
-#ifdef USE_IFC4
+#ifdef SCHEMA_HAS_IfcIndexedPolyCurve
 
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcIndexedPolyCurve* l, TopoDS_Wire& result) {
 	
@@ -877,7 +1007,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcIndexedPolyCurve* l, TopoDS_Wi
 		IfcEntityList::ptr segments = l->Segments();
 		for (IfcEntityList::it it = segments->begin(); it != segments->end(); ++it) {
 			IfcUtil::IfcBaseClass* segment = *it;
-			if (segment->is(IfcSchema::Type::IfcLineIndex)) {
+			if (segment->declaration().is(IfcSchema::IfcLineIndex::Class())) {
 				IfcSchema::IfcLineIndex* line = (IfcSchema::IfcLineIndex*) segment;
 				std::vector<int> indices = *line;
 				gp_Pnt previous;
@@ -887,11 +1017,16 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcIndexedPolyCurve* l, TopoDS_Wi
 					}
 					const gp_Pnt& current = points[*jt - 1];
 					if (jt != indices.begin()) {
-						w.Add(BRepBuilderAPI_MakeEdge(previous, current));
+						BRepBuilderAPI_MakeEdge me(previous, current);
+						if (me.IsDone()) {
+							w.Add(me.Edge());
+						} else {
+							Logger::Warning("Ignoring segment on", l);
+						}						
 					}
 					previous = current;
 				}
-			} else if (segment->is(IfcSchema::Type::IfcArcIndex)) {
+			} else if (segment->declaration().is(IfcSchema::IfcArcIndex::Class())) {
 				IfcSchema::IfcArcIndex* arc = (IfcSchema::IfcArcIndex*) segment;
 				std::vector<int> indices = *arc;
 				if (indices.size() != 3) {
@@ -907,9 +1042,14 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcIndexedPolyCurve* l, TopoDS_Wi
 				const gp_Pnt& b = points[indices[1] - 1];
 				const gp_Pnt& c = points[indices[2] - 1];
 				Handle(Geom_Circle) circ = GC_MakeCircle(a, b, c).Value();
-				w.Add(BRepBuilderAPI_MakeEdge(circ, a, c));
+				BRepBuilderAPI_MakeEdge me(circ, a, c);
+				if (me.IsDone()) {
+					w.Add(me.Edge());
+				} else {
+					Logger::Warning("Ignoring segment on", l);
+				}
 			} else {
-				throw IfcParse::IfcException("Unexpected IfcIndexedPolyCurve segment of type " + IfcSchema::Type::ToString(segment->type()));
+				throw IfcParse::IfcException("Unexpected IfcIndexedPolyCurve segment of type " + segment->declaration().name());
 			}
 		}
 	} else if (points.begin() < points.end()) {

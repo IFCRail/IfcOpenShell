@@ -38,7 +38,10 @@
 #include <fcntl.h>
 #endif
 
-#include "../ifcgeom/IfcGeomIterator.h"
+#include "../ifcgeom_schema_agnostic/IfcGeomIterator.h"
+#include "../ifcgeom/IfcGeomElement.h"
+#include "../ifcparse/IfcFile.h"
+#include "../ifcparse/IfcLogger.h"
 
 #if USE_VLD
 #include <vld.h>
@@ -46,9 +49,11 @@
 
 #include <GProp_GProps.hxx>
 #include <BRepGProp.hxx>
+#include <BRepBndLib.hxx>
+#include <Bnd_Box.hxx>
 #include <Geom_Plane.hxx>
 
-using namespace boost;
+#include <memory>
 
 template <typename T>
 union data_field {
@@ -86,6 +91,21 @@ std::string format_json(const std::string& s) {
 	return "\"" + s + "\"";
 }
 
+template <>
+std::string format_json(const double& d) {
+	std::stringstream ss;
+	ss << std::setprecision(std::numeric_limits<double>::digits10) << d;
+	return ss.str();
+}
+
+template <>
+std::string format_json(const gp_Dir& d) {
+	std::stringstream ss;
+	ss << std::setprecision(std::numeric_limits<double>::digits10) 
+		<< "[" << d.X() << "," << d.Y() << "," << d.Z() << "]";
+	return ss.str();
+}
+
 static std::streambuf *stdout_orig, *stdout_redir;
 
 template <typename T>
@@ -101,6 +121,20 @@ void swrite(std::ostream& s, std::string t) {
 	swrite(s, len);
 	s.write(t.c_str(), len);
 	while (len++ % 4) s.put(0);
+}
+
+template <typename T, typename U>
+void swrite_array(std::ostream& s, const std::vector<U>& us) {
+	if (std::is_same<T, U>::value) {
+		swrite(s, std::string((char*)us.data(), us.size() * sizeof(U)));
+	} else {
+		std::vector<T> ts;
+		ts.reserve(us.size());
+		for (auto& u : us) {
+			ts.push_back((T)u);
+		}
+		swrite_array<T, T>(s, ts);
+	}
 }
 
 class Command {
@@ -152,7 +186,7 @@ protected:
 	}
 public:
 	const std::string& string() { return str; }
-	Hello() : Command(HELLO), str("IfcOpenShell-" IFCOPENSHELL_VERSION "-2") {}
+	Hello() : Command(HELLO), str("IfcOpenShell-" IFCOPENSHELL_VERSION "-0") {}
 };
 
 class More : public Command {
@@ -215,13 +249,45 @@ public:
 };
 
 class EntityExtension {
+protected:
+	bool trailing_, opened_;
+	std::stringstream json_;
+
+	template <typename T>
+	void put_json(const std::string& k, T v) {
+		if (!opened_) {
+			json_ << "{";
+			opened_ = true;
+		}
+		if (trailing_) {
+			json_ << ",";
+		}
+		json_ << format_json(k) << ":" << format_json(v);
+		trailing_ = true;
+	}
 public:
-	virtual void write_contents(std::ostream& s) = 0;
+	EntityExtension()
+		: trailing_(false)
+		, opened_(false)
+	{}
+
+	void write_contents(std::ostream& s) {
+		if (opened_) {
+			json_ << "}";
+		}
+
+		// We do a 4-byte manual alignment
+		std::string payload = json_.str();
+		s << payload;
+		if (payload.size() % 4) {
+			s << std::string(4 - (payload.size() % 4), ' ');
+		}
+	}
 };
 
 class Entity : public Command {
 private:
-	const IfcGeom::TriangulationElement<float>* geom;
+	const IfcGeom::TriangulationElement<double, double>* geom;
 	bool append_line_data;
 	EntityExtension* eext_;
 protected:
@@ -232,22 +298,23 @@ protected:
 		swrite(s, geom->name());
 		swrite(s, geom->type());
 		swrite<int32_t>(s, geom->parent_id());
-		const std::vector<float>& m = geom->transformation().matrix().data();
-		const float matrix_array[16] = {
+		const std::vector<double>& m = geom->transformation().matrix().data();
+		const double matrix_array[16] = {
 			m[0], m[3], m[6], m[ 9],
 			m[1], m[4], m[7], m[10],
 			m[2], m[5], m[8], m[11],
 			   0,    0,    0,     1
 		};
-		swrite(s, std::string((char*)matrix_array, 16 * sizeof(float)));
+		swrite(s, std::string((char*)matrix_array, 16 * sizeof(double)));
 		
 		// The first bit of the string is always the instance name of the representation.
 		const std::string& representation_id = geom->geometry().id();
 		const int integer_representation_id = atoi(representation_id.c_str());
 		swrite<int32_t>(s, (int32_t)integer_representation_id);
 
-		swrite(s, std::string((char*)geom->geometry().verts().data(), geom->geometry().verts().size() * sizeof(float)));
-		swrite(s, std::string((char*)geom->geometry().normals().data(), geom->geometry().normals().size() * sizeof(float)));
+		swrite_array<double>(s, geom->geometry().verts());
+		swrite_array<float>(s, geom->geometry().normals());
+
 		{
 			std::vector<int32_t> indices;
 			const std::vector<int>& faces = geom->geometry().faces();
@@ -255,7 +322,7 @@ protected:
 			for (std::vector<int>::const_iterator it = faces.begin(); it != faces.end(); ++it) {
 				indices.push_back(*it);
 			} 
-			swrite(s, std::string((char*) indices.data(), indices.size() * sizeof(int32_t)));
+			swrite_array<int32_t>(s, indices);
 
 			if (append_line_data) {
 				std::vector<int32_t> lines;
@@ -274,40 +341,62 @@ protected:
 					lines.push_back(i2);
 				}
 
-				swrite(s, std::string((char*) lines.data(), lines.size() * sizeof(int32_t)));
+				swrite_array<int32_t>(s, lines);
 			}
 		}
-		{ std::vector<float> diffuse_color_array;
-		for (std::vector<IfcGeom::Material>::const_iterator it = geom->geometry().materials().begin(); it != geom->geometry().materials().end(); ++it) {
-			const IfcGeom::Material& mat = *it;
-			if (mat.hasDiffuse()) {
-				const double* color = mat.diffuse();
-				diffuse_color_array.push_back(static_cast<float>(color[0]));
-				diffuse_color_array.push_back(static_cast<float>(color[1]));
-				diffuse_color_array.push_back(static_cast<float>(color[2]));
-			} else {
-				diffuse_color_array.push_back(0.f);
-				diffuse_color_array.push_back(0.f);
-				diffuse_color_array.push_back(0.f);
+		{ 
+			// We remove the blanks here from the material array. I.e. materials without a diffuse color
+			std::vector<boost::optional<std::array<float, 4> > > diffuse_color_array;
+			for (std::vector<IfcGeom::Material>::const_iterator it = geom->geometry().materials().begin(); it != geom->geometry().materials().end(); ++it) {
+				const IfcGeom::Material& mat = *it;
+				if (mat.hasDiffuse()) {
+					const double* color = mat.diffuse();
+					diffuse_color_array.push_back(std::array<float, 4>{
+						static_cast<float>(color[0]),
+						static_cast<float>(color[1]),
+						static_cast<float>(color[2]),
+						mat.hasTransparency() ? static_cast<float>(1. - mat.transparency()) : 1.f
+					});
+				} else {
+					diffuse_color_array.emplace_back();
+				}
 			}
-			if (mat.hasTransparency()) {
-				diffuse_color_array.push_back(static_cast<float>(1. - mat.transparency()));
-			} else {
-				diffuse_color_array.push_back(1.f);
+
+			std::map<int, int> orig_to_condensed_index_map;
+			std::vector<float> diffuse_color_array_condensed;
+			
+			int new_index = 0;
+			for (size_t orig = 0; orig < diffuse_color_array.size(); ++orig) {
+				auto& m = diffuse_color_array[orig];
+				if (m) {
+					for (int i = 0; i < 4; ++i) {
+						diffuse_color_array_condensed.push_back((*m)[i]);
+					}
+					orig_to_condensed_index_map[orig] = new_index++;
+				}
 			}
+
+			swrite(s, std::string((char*) diffuse_color_array_condensed.data(), diffuse_color_array_condensed.size() * sizeof(float)));
+
+			std::vector<int32_t> material_indices;
+			for (std::vector<int>::const_iterator it = geom->geometry().material_ids().begin(); it != geom->geometry().material_ids().end(); ++it) {
+				// @todo use something like std::equal_range() ?
+				auto jt = orig_to_condensed_index_map.find(*it);
+				if (jt == orig_to_condensed_index_map.end()) {
+					material_indices.push_back(-1);
+				} else {
+					material_indices.push_back(jt->second);
+				}
+			}
+
+			swrite(s, std::string((char*) material_indices.data(), material_indices.size() * sizeof(int32_t)));
 		}
-		swrite(s, std::string((char*) diffuse_color_array.data(), diffuse_color_array.size() * sizeof(float))); }
-		{ std::vector<int32_t> material_indices;
-		for (std::vector<int>::const_iterator it = geom->geometry().material_ids().begin(); it != geom->geometry().material_ids().end(); ++it) {
-			material_indices.push_back(*it);
-		} 
-		swrite(s, std::string((char*) material_indices.data(), material_indices.size() * sizeof(int32_t))); }
 		if (eext_) {
 			eext_->write_contents(s);
 		}
 	}
 public:
-	Entity(const IfcGeom::TriangulationElement<float>* geom, EntityExtension* eext = 0) : Command(ENTITY), geom(geom), append_line_data(false), eext_(eext) {};
+	Entity(const IfcGeom::TriangulationElement<double, double>* geom, EntityExtension* eext = 0) : Command(ENTITY), geom(geom), append_line_data(false), eext_(eext) {};
 };
 
 class Next : public Command {
@@ -355,103 +444,98 @@ protected:
 		swrite(s, value_);
 	}
 public:
-	Setting(uint32_t k = 0, uint32_t v = 0) : Command(DEFLECTION), id_(k), value_(v) {};
+	Setting(uint32_t k = 0, uint32_t v = 0) : Command(SETTING), id_(k), value_(v) {};
 	uint32_t id() const { return id_; }
 	uint32_t value() const { return value_; }
 };
 
 static const std::string TOTAL_SURFACE_AREA = "TOTAL_SURFACE_AREA";
 static const std::string TOTAL_SHAPE_VOLUME = "TOTAL_SHAPE_VOLUME";
+static const std::string SURFACE_AREA_ALONG_X = "SURFACE_AREA_ALONG_X";
+static const std::string SURFACE_AREA_ALONG_Y = "SURFACE_AREA_ALONG_Y";
+static const std::string SURFACE_AREA_ALONG_Z = "SURFACE_AREA_ALONG_Z";
 static const std::string WALKABLE_SURFACE_AREA = "WALKABLE_SURFACE_AREA";
-static const double MAX_WALKABLE_SURFACE_ANGLE_DEGREES = 15.;
+static const std::string LARGEST_FACE_AREA = "LARGEST_FACE_AREA";
+static const std::string LARGEST_FACE_DIRECTION = "LARGEST_FACE_DIRECTION";
+static const std::string BOUNDING_BOX_SIZE_ALONG_ = "BOUNDING_BOX_SIZE_ALONG_";
+static const std::array<std::string, 3> XYZ = { "X", "Y", "Z" };
 
-class QuantityWriter : public EntityExtension {
+class QuantityWriter_v0 : public EntityExtension {
 private:
-	const IfcGeom::BRepElement<float>* elem_;
+	const IfcGeom::BRepElement<double, double>* elem_;
 public:
-	QuantityWriter(const IfcGeom::BRepElement<float>* elem) :
-		elem_(elem)
-	{}
-	void write_contents(std::ostream& s) {
-		
-		double total_surface_area = 0.;
-		double total_shape_volume = 0.;
-		double walkable_surface_area = 0.;
+	QuantityWriter_v0(const IfcGeom::BRepElement<double, double>* elem) :
+		elem_(elem) 
+	{
+		put_json(TOTAL_SURFACE_AREA, 0.);
+		put_json(TOTAL_SHAPE_VOLUME, 0.);
+		if (elem_->type() == "IfcSpace") {
+			put_json(WALKABLE_SURFACE_AREA, 0.);
+		}	
+	}
+};
 
-		for (IfcGeom::IfcRepresentationShapeItems::const_iterator it = elem_->geometry().begin(); it != elem_->geometry().end(); ++it) {
-			gp_GTrsf gtrsf = it->Placement();
-			const gp_Trsf& o_trsf = elem_->transformation().data();
-			gtrsf.PreMultiply(o_trsf);
-			const TopoDS_Shape& shp = it->Shape();
-			const TopoDS_Shape moved_shape = IfcGeom::Kernel::apply_transformation(shp, gtrsf);
-			
-			{
-				GProp_GProps prop_area;
-				BRepGProp::SurfaceProperties(moved_shape, prop_area);
-				total_surface_area += prop_area.Mass();
-			}
+class QuantityWriter_v1 : public EntityExtension {
+private:
+	const IfcGeom::BRepElement<double, double>* elem_;
+public:
+	QuantityWriter_v1(const IfcGeom::BRepElement<double, double>* elem) :
+		elem_(elem) {
+		double a, b, c, largest_face_area = 0.;
 
-			{
-				GProp_GProps prop_volume;
-				BRepGProp::VolumeProperties(moved_shape, prop_volume);
-				total_shape_volume += prop_volume.Mass();
-			}
+		if (elem_->geometry().calculate_surface_area(a)) {
+			put_json(TOTAL_SURFACE_AREA, a);
+		}
 
-			if (elem_->type() == "IfcSpace") {
-				TopExp_Explorer exp(moved_shape, TopAbs_FACE);
-				for (; exp.More(); exp.Next()) {
-					const TopoDS_Face& face = TopoDS::Face(exp.Current());
-					Handle(Geom_Surface) surf = BRep_Tool::Surface(face);
+		if (elem_->geometry().calculate_volume(a)) {
+			put_json(TOTAL_SHAPE_VOLUME, a);
+		}
 
-					// Assume we can only walk on planar surfaces
-					if (surf->DynamicType() != STANDARD_TYPE(Geom_Plane)) {
-						continue;
-					}
+		if (elem_->calculate_projected_surface_area(a, b, c)) {
+			put_json(SURFACE_AREA_ALONG_X, a);
+			put_json(SURFACE_AREA_ALONG_Y, b);
+			put_json(SURFACE_AREA_ALONG_Z, c);
+		}
 
-					BRepGProp_Face prop(face);
-					double u0, u1, v0, v1;
-					BRepTools::UVBounds(face, u0, u1, v0, v1);
-					gp_Pnt p;
-					gp_Vec normal_direction;
-					prop.Normal((u0 + u1) / 2., (v0 + v1) / 2., p, normal_direction);
+		boost::optional<gp_Dir> largest_face_dir;
 
-					gp_Vec normal(0., 0., 0.);
-					if (normal_direction.Magnitude() > ALMOST_ZERO) {
-						normal = gp_Dir(normal_direction.XYZ());
-					}
+		{
+			TopoDS_Compound compound = elem_->geometry().as_compound(true);
+			TopExp_Explorer exp(compound, TopAbs_FACE);
+			for (; exp.More(); exp.Next()) {
+				GProp_GProps prop;
+				BRepGProp::SurfaceProperties(exp.Current(), prop);
+				const double area = prop.Mass();
+				if (area > largest_face_area) {
+					largest_face_area = area;
 
-					if (normal.Angle(gp::DZ()) < (MAX_WALKABLE_SURFACE_ANGLE_DEGREES * M_PI / 180.0)) {
-						GProp_GProps prop_face;
-						BRepGProp::SurfaceProperties(face, prop_face);
-						walkable_surface_area += prop_face.Mass();
+					Handle(Geom_Surface) surf = BRep_Tool::Surface(TopoDS::Face(exp.Current()));
+					if (surf->DynamicType() == STANDARD_TYPE(Geom_Plane)) {
+						largest_face_dir = Handle(Geom_Plane)::DownCast(surf)->Axis().Direction();
+						if (exp.Current().Orientation() == TopAbs_REVERSED) {
+							largest_face_dir->Reverse();
+						}
 					}
 				}
 			}
-		}
-		
-		// TODO: Manual JSON formatting is always a bad idea
-		std::ostringstream ss;
-		ss.write("{", 1);
-		ss << format_json(TOTAL_SURFACE_AREA);
-		ss.write(":", 1);
-		ss << format_json(total_surface_area);
-		ss.write(",", 1);
-		ss << format_json(TOTAL_SHAPE_VOLUME);
-		ss.write(":", 1);
-		ss << format_json(total_shape_volume);
-		if (elem_->type() == "IfcSpace") {
-			ss.write(",", 1);
-			ss << format_json(WALKABLE_SURFACE_AREA);
-			ss.write(":", 1);
-			ss << format_json(walkable_surface_area);
-		}
-		ss.write("}", 1);
 
-		// We do a 4-byte manual alignment
-		std::string payload = ss.str();
-		s << payload;
-		if (payload.size() % 4) {
-			s << std::string(4 - (payload.size() % 4), ' ');
+			Bnd_Box box;
+			double xyz[6];
+
+			BRepBndLib::AddClose(compound, box);
+
+			if (!box.IsVoid()) {
+				box.Get(xyz[0], xyz[1], xyz[2], xyz[3], xyz[4], xyz[5]);
+				for (int i = 0; i < 3; ++i) {
+					const double bsz = xyz[i + 3] - xyz[i];
+					put_json(BOUNDING_BOX_SIZE_ALONG_ + XYZ[i], bsz);
+				}
+			}
+		}
+
+		if (largest_face_dir) {
+			put_json(LARGEST_FACE_DIRECTION, *largest_face_dir);
+			put_json(LARGEST_FACE_AREA, largest_face_area);
 		}
 	}
 };
@@ -464,6 +548,8 @@ int main () {
 	stdout_orig = std::cout.rdbuf();
 	std::cout.rdbuf(stdout_redir);
 
+	bool emit_quantities = false;
+
 #ifdef SET_BINARY_STREAMS
 	_setmode(_fileno(stdout), _O_BINARY);
 	std::cout.setf(std::ios_base::binary);
@@ -474,7 +560,8 @@ int main () {
 	double deflection = 1.e-3;
 	bool has_more = false;
 
-	IfcGeom::Iterator<float>* iterator = 0;
+	IfcGeom::Iterator<double, double>* iterator = 0;
+	IfcParse::IfcFile* file = 0;
 	std::vector< std::pair<uint32_t, uint32_t> > setting_pairs;
 
 	Hello().write(std::cout);
@@ -498,11 +585,17 @@ int main () {
 			std::vector< std::pair<uint32_t, uint32_t> >::const_iterator it = setting_pairs.begin();
 			for (; it != setting_pairs.end(); ++it) {
 				settings.set(it->first, it->second != 0);
+				if (it->first == IfcGeom::IteratorSettings::SEW_SHELLS && it->second) {
+					// Quantities (especially volume) can be emitted if there are proper
+					// topologically valid geometries being created.
+					emit_quantities = true;
+				}
 			}
 
 			settings.set_deflection_tolerance(deflection);
 
-			iterator = new IfcGeom::Iterator<float>(settings, data, (int)len);
+			file = new IfcParse::IfcFile(data, (int)len);
+			iterator = new IfcGeom::Iterator<double, double>(settings, file);
 			has_more = iterator->initialize();
 
 			More(has_more).write(std::cout);
@@ -514,16 +607,23 @@ int main () {
 				exit_code = 1;
 				break;
 			}
-			const IfcGeom::TriangulationElement<float>* geom = static_cast<const IfcGeom::TriangulationElement<float>*>(iterator->get());
-			QuantityWriter eext(iterator->get_native());
-			Entity(geom, &eext).write(std::cout);
+			const IfcGeom::TriangulationElement<double, double>* geom = static_cast<const IfcGeom::TriangulationElement<double, double>*>(iterator->get());
+			std::unique_ptr<EntityExtension> eext;
+			if (emit_quantities) {
+				eext.reset(new QuantityWriter_v1(iterator->get_native()));
+			} else {
+				eext.reset(new QuantityWriter_v0(iterator->get_native()));
+			}
+			Entity(geom, eext.get()).write(std::cout);
 			continue;
 		}
 		case NEXT: {
 			Next n; n.read(std::cin);
 			has_more = iterator->next() != 0;
 			if (!has_more) {
+				delete file;
 				delete iterator;
+				file = 0;
 				iterator = 0;
 			}
 			More(has_more).write(std::cout);
@@ -531,7 +631,7 @@ int main () {
 		}
 		case GET_LOG: {
 			GetLog gl; gl.read(std::cin);
-			WriteLog(iterator->getLog()).write(std::cout);
+			WriteLog(Logger::GetLog()).write(std::cout);
 			continue;
 		}
 		case BYE: {

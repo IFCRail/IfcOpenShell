@@ -18,7 +18,9 @@
  ********************************************************************************/
 
 #include "IfcLogger.h"
+
 #include "../ifcparse/IfcException.h"
+#include "../ifcparse/Argument.h"
 
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/optional.hpp>
@@ -27,6 +29,7 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/version.hpp>
 
+#include <mutex>
 #include <iostream>
 #include <algorithm>
 
@@ -34,24 +37,25 @@ namespace {
 	
 	template <typename T>
 	struct severity_strings {
-		static const std::array<std::basic_string<T>, 3> value;
+		static const std::array<std::basic_string<T>, 4> value;
 	};
 
 	template <>
-	const std::array<std::basic_string<char>, 3> severity_strings<char>::value = { "Notice", "Warning", "Error" };
+	const std::array<std::basic_string<char>, 4> severity_strings<char>::value = { "Debug", "Notice", "Warning", "Error" };
 
 	template <>
-	const std::array<std::basic_string<wchar_t>, 3> severity_strings<wchar_t>::value = { L"Notice", L"Warning", L"Error" };
+	const std::array<std::basic_string<wchar_t>, 4> severity_strings<wchar_t>::value = { L"Debug", L"Notice", L"Warning", L"Error" };
 	
 	template <typename T>
-	void plain_text_message(T& os, const boost::optional<IfcSchema::IfcProduct*>& current_product, Logger::Severity type, const std::string& message, IfcEntityInstanceData* entity) {
+	void plain_text_message(T& os, const boost::optional<IfcUtil::IfcBaseClass*>& current_product, Logger::Severity type, const std::string& message, const IfcUtil::IfcBaseClass* instance) {
 		os << "[" << severity_strings<typename T::char_type>::value[type] << "] ";
 		if (current_product) {
-			os << "{" << (*current_product)->GlobalId().c_str() << "} ";
+            std::string global_id = *((IfcUtil::IfcBaseEntity*)*current_product)->get("GlobalId");
+			os << "{" << global_id.c_str() << "} ";
 		}
 		os << message.c_str() << std::endl;
-		if (entity) {
-			std::string instance_string = entity->toString();
+		if (instance) {
+			std::string instance_string = instance->data().toString();
 			if (instance_string.size() > 259) {
 				instance_string = instance_string.substr(0, 256) + "...";
 			}
@@ -67,7 +71,7 @@ namespace {
 	}
 
 	template <typename T>
-	void json_message(T& os, const boost::optional<IfcSchema::IfcProduct*>& current_product, Logger::Severity type, const std::string& message, IfcEntityInstanceData* entity) {
+	void json_message(T& os, const boost::optional<IfcUtil::IfcBaseClass*>& current_product, Logger::Severity type, const std::string& message, const IfcUtil::IfcBaseClass* instance) {
 		boost::property_tree::basic_ptree<std::basic_string<typename T::char_type>, std::basic_string<typename T::char_type> > pt;
 		
 		// @todo this is crazy
@@ -78,17 +82,20 @@ namespace {
 		
 		pt.put(level_string, severity_strings<typename T::char_type>::value[type]);
 		if (current_product) {
-			pt.put(product_string, string_as<typename T::char_type>((**current_product).entity->toString()));
+			pt.put(product_string, string_as<typename T::char_type>((**current_product).data().toString()));
 		}
 		pt.put(message_string, string_as<typename T::char_type>(message));
-		if (entity) {
-			pt.put(instance_string, string_as<typename T::char_type>(entity->toString()));
+		if (instance) {
+			pt.put(instance_string, string_as<typename T::char_type>(instance->data().toString()));
 		}
 		boost::property_tree::write_json(os, pt, false);
 	}
 }
 
-void Logger::SetProduct(boost::optional<IfcSchema::IfcProduct*> product) {
+void Logger::SetProduct(boost::optional<IfcUtil::IfcBaseClass*> product) {
+	if (verbosity == LOG_DEBUG && product) {
+		Message(LOG_DEBUG, "Begin processing", *product);
+	}
 	current_product = product;
 }
 
@@ -110,38 +117,32 @@ void Logger::SetOutput(std::wostream* l1, std::wostream* l2) {
 	}
 }
 
-template <typename T>
-void Logger::log(T& log2, Logger::Severity type, const std::string& message, IfcEntityInstanceData* entity) {
-	log2 << "[" << severity_strings<typename T::char_type>::value[type] << "] ";
-	if (current_product) {
-		log2 << "{" << (*current_product)->GlobalId().c_str() << "} ";
-	}
-	log2 << message.c_str() << std::endl;
-	if (entity) {
-		log2 << entity->toString().c_str() << std::endl;
-	}
-}
+void Logger::Message(Logger::Severity type, const std::string& message, const IfcUtil::IfcBaseClass* instance) {
+	static std::mutex m;
+	std::lock_guard<std::mutex> lk(m);
 
-void Logger::Message(Logger::Severity type, const std::string& message, IfcEntityInstanceData* entity) {
+	if (type > max_severity) {
+		max_severity = type;
+	}
 	if ((log2 || wlog2) && type >= verbosity) {
 		if (format == FMT_PLAIN) {
             if (log2) {
-                plain_text_message(*log2, current_product, type, message, entity);
+                plain_text_message(*log2, current_product, type, message, instance);
             } else if (wlog2) {
-                plain_text_message(*wlog2, current_product, type, message, entity);
+                plain_text_message(*wlog2, current_product, type, message, instance);
             }
 		} else if (format == FMT_JSON) {
             if (log2) {
-                json_message(*log2, current_product, type, message, entity);
+                json_message(*log2, current_product, type, message, instance);
             } else if (wlog2) {
-                json_message(*wlog2, current_product, type, message, entity);
+                json_message(*wlog2, current_product, type, message, instance);
             }
 		}
 	}
 }
 
-void Logger::Message(Logger::Severity type, const std::exception& exception, IfcEntityInstanceData* entity) {
-	Message(type, exception.what(), entity);
+void Logger::Message(Logger::Severity type, const std::exception& exception, const IfcUtil::IfcBaseClass* instance) {
+	Message(type, std::string(exception.what()), instance);
 }
 
 template <typename T>
@@ -173,6 +174,8 @@ std::string Logger::GetLog() {
 void Logger::Verbosity(Logger::Severity v) { verbosity = v; }
 Logger::Severity Logger::Verbosity() { return verbosity; }
 
+Logger::Severity Logger::MaxSeverity() { return max_severity; }
+
 void Logger::OutputFormat(Format f) { format = f; }
 Logger::Format Logger::OutputFormat() { return format; }
 
@@ -182,5 +185,6 @@ std::wostream* Logger::wlog1 = 0;
 std::wostream* Logger::wlog2 = 0;
 std::stringstream Logger::log_stream;
 Logger::Severity Logger::verbosity = Logger::LOG_NOTICE;
+Logger::Severity Logger::max_severity = Logger::LOG_NOTICE;
 Logger::Format Logger::format = Logger::FMT_PLAIN;
-boost::optional<IfcSchema::IfcProduct*> Logger::current_product;
+boost::optional<IfcUtil::IfcBaseClass*> Logger::current_product;

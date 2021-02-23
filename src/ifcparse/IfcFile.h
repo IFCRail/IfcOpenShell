@@ -22,22 +22,54 @@
 
 #include <map>
 #include <set>
+#include <iterator>
 #include <boost/unordered_map.hpp>
 
 #include "ifc_parse_api.h"
 
 #include "../ifcparse/IfcParse.h"
 #include "../ifcparse/IfcSpfHeader.h"
+#include "../ifcparse/IfcSchema.h"
 
 namespace IfcParse {
+
+class IFC_PARSE_API file_open_status {
+public:
+	enum file_open_enum {
+		SUCCESS,
+		READ_ERROR,
+		NO_HEADER,
+		UNSUPPORTED_SCHEMA
+	};
+
+private:
+	file_open_enum error_;
+
+public:
+	file_open_status(file_open_enum error)
+		: error_(error)
+	{}
+
+	operator file_open_enum() const {
+		return error_;
+	}
+
+	file_open_enum value() const {
+		return error_;
+	}
+
+	operator bool() const {
+		return error_ == SUCCESS;
+	}
+};
 
 /// This class provides several static convenience functions and variables
 /// and provide access to the entities in an IFC file
 class IFC_PARSE_API IfcFile {
 public:
-	typedef std::map<IfcSchema::Type::Enum, IfcEntityList::ptr> entities_by_type_t;
+	typedef std::map<const IfcParse::declaration*, IfcEntityList::ptr> entities_by_type_t;
 	typedef boost::unordered_map<unsigned int, IfcUtil::IfcBaseClass*> entity_by_id_t;
-	typedef std::map<std::string, IfcSchema::IfcRoot*> entity_by_guid_t;
+	typedef std::map<std::string, IfcUtil::IfcBaseClass*> entity_by_guid_t;
 	typedef std::map<unsigned int, std::vector<unsigned int> > entities_by_ref_t;
 	typedef std::map<unsigned int, IfcEntityList::ptr> ref_map_t;
 	typedef entity_by_id_t::const_iterator const_iterator;
@@ -62,6 +94,10 @@ public:
 			entities_by_type_t::const_iterator::operator++(); return *this; 
 		}
 
+		type_iterator operator++(int) { 
+			type_iterator tmp(*this); operator++(); return tmp; 
+		}
+
 		bool operator!=(const type_iterator& other) const {
 			const entities_by_type_t::const_iterator& self_ = *this;
 			const entities_by_type_t::const_iterator& other_ = other;
@@ -73,6 +109,10 @@ private:
 	typedef std::map<IfcUtil::IfcBaseClass*, IfcUtil::IfcBaseClass*> entity_entity_map_t;
 
 	bool parsing_complete_;
+	file_open_status good_ = file_open_status::SUCCESS;
+
+	const IfcParse::schema_definition* schema_;
+	const IfcParse::declaration* ifcroot_type_;
 
 	entity_by_id_t byid;
 	entities_by_type_t bytype;
@@ -88,12 +128,26 @@ private:
 
 	void setDefaultHeaderValues();
 
+	void initialize_(IfcParse::IfcSpfStream* f);
+
+	void build_inverses_(IfcUtil::IfcBaseClass*);
 public:
 	IfcParse::IfcSpfLexer* tokens;
 	IfcParse::IfcSpfStream* stream;
 	
-	IfcFile();
-	~IfcFile();
+#ifdef USE_MMAP
+	IfcFile(const std::string& fn, bool mmap = false);
+#else
+	IfcFile(const std::string& fn);
+#endif
+	IfcFile(std::istream& fn, int len);
+	IfcFile(void* data, int len);
+	IfcFile(IfcParse::IfcSpfStream* f);
+	IfcFile(const IfcParse::schema_definition* schema = IfcParse::schema_by_name("IFC4"));
+
+	virtual ~IfcFile();
+
+	file_open_status good() const { return good_; }
 	
 	/// Returns the first entity in the file, this probably is the entity
 	/// with the lowest id (EXPRESS ENTITY_INSTANCE_NAME)
@@ -112,8 +166,18 @@ public:
 	/// NOTE: This also returns subtypes of the requested type, for example:
 	/// IfcWall will also return IfcWallStandardCase entities
 	template <class T>
-	typename T::list::ptr entitiesByType() {
-		IfcEntityList::ptr untyped_list = entitiesByType(T::Class());
+	typename T::list::ptr instances_by_type() {
+		IfcEntityList::ptr untyped_list = instances_by_type(&T::Class());
+		if (untyped_list) {
+			return untyped_list->as<T>();
+		} else {
+			return typename T::list::ptr(new typename T::list);
+		}
+	}
+
+	template <class T>
+	typename T::list::ptr instances_by_type_excl_subtypes() {
+		IfcEntityList::ptr untyped_list = instances_by_type_excl_subtypes(&T::Class());
 		if (untyped_list) {
 			return untyped_list->as<T>();
 		} else {
@@ -124,50 +188,53 @@ public:
 	/// Returns all entities in the file that match the positional argument.
 	/// NOTE: This also returns subtypes of the requested type, for example:
 	/// IfcWall will also return IfcWallStandardCase entities
-	IfcEntityList::ptr entitiesByType(IfcSchema::Type::Enum t);
+	IfcEntityList::ptr instances_by_type(const IfcParse::declaration*);
 
 	/// Returns all entities in the file that match the positional argument.
-	IfcEntityList::ptr entitiesByTypeExclSubtypes(IfcSchema::Type::Enum t);
+	IfcEntityList::ptr instances_by_type_excl_subtypes(const IfcParse::declaration*);
 
 	/// Returns all entities in the file that match the positional argument.
 	/// NOTE: This also returns subtypes of the requested type, for example:
 	/// IfcWall will also return IfcWallStandardCase entities
-	IfcEntityList::ptr entitiesByType(const std::string& t);
+	IfcEntityList::ptr instances_by_type(const std::string& t);
 
+	/// Returns all entities in the file that match the positional argument.
+	IfcEntityList::ptr instances_by_type_excl_subtypes(const std::string& t);
+	
 	/// Returns all entities in the file that reference the id
-	IfcEntityList::ptr entitiesByReference(int id);
+	IfcEntityList::ptr instances_by_reference(int id);
 
 	/// Returns the entity with the specified id
-	IfcUtil::IfcBaseClass* entityById(int id);
+	IfcUtil::IfcBaseClass* instance_by_id(int id);
 
 	/// Returns the entity with the specified GlobalId
-	IfcSchema::IfcRoot* entityByGuid(const std::string& guid);
+	IfcUtil::IfcBaseClass* instance_by_guid(const std::string& guid);
 
 	/// Performs a depth-first traversal, returning all entity instance
 	/// attributes as a flat list. NB: includes the root instance specified
 	/// in the first function argument.
 	IfcEntityList::ptr traverse(IfcUtil::IfcBaseClass* instance, int max_level=-1);
 
+	IfcEntityList::ptr getInverse(int instance_id, const IfcParse::declaration* type, int attribute_index);
+
 	/// Marks entity as modified so that potential cache for it is invalidated.
 	/// @todo Currently the whole cache is invalidated. Implement more fine-grained invalidation.
 	void mark_entity_as_modified(int id);
-
-#ifdef USE_MMAP
-	bool Init(const std::string& fn, bool mmap=false);
-#else
-	bool Init(const std::string& fn);
-#endif
-	bool Init(std::istream& fn, int len);
-	bool Init(void* data, int len);
-	bool Init(IfcParse::IfcSpfStream* f);
-
-	IfcEntityList::ptr getInverse(int instance_id, IfcSchema::Type::Enum type, int attribute_index);
 
 	unsigned int FreshId() { return ++MaxId; }
 
 	IfcUtil::IfcBaseClass* addEntity(IfcUtil::IfcBaseClass* entity);
 	void addEntities(IfcEntityList::ptr es);
 
+	/// Removes entity instance from file and unsets references.
+	///
+	/// Attention when running removeEntity inside a loop over a list of entities to be removed. 
+	/// This invalidates the iterator. A workaround is to reverse the loop:
+	/// boost::shared_ptr<IfcEntityList> entities = ...;
+	/// for (auto it = entities->end() - 1; it >= entities->begin(); --it) {
+	///    IfcUtil::IfcBaseClass *const inst = *it;
+	///    model->removeEntity(inst);
+	/// }
 	void removeEntity(IfcUtil::IfcBaseClass* entity);
 
 	const IfcSpfHeader& header() const { return _header; }
@@ -175,15 +242,27 @@ public:
 
 	std::string createTimestamp() const;
 
-	std::pair<IfcSchema::IfcNamedUnit*, double> getUnit(IfcSchema::IfcUnitEnum::IfcUnitEnum);
-
-	void load(const IfcEntityInstanceData&);
-	void load(unsigned entity_instance_name, std::vector<Argument*>& attributes);
+	size_t load(unsigned entity_instance_name, Argument**& attributes, size_t num_attributes);
+	void seek_to(const IfcEntityInstanceData& data);
+	void try_read_semicolon();
 
 	void register_inverse(unsigned, Token);
 	void register_inverse(unsigned, IfcUtil::IfcBaseClass*);
 	void unregister_inverse(unsigned, IfcUtil::IfcBaseClass*);
+    
+	const IfcParse::schema_definition* schema() const { return schema_; }
+
+	std::pair<IfcUtil::IfcBaseClass*, double> getUnit(const std::string& unit_type);
+
+	bool parsing_complete() const { return parsing_complete_; }
+	bool& parsing_complete() { return parsing_complete_; }
+
+	void build_inverses();
 };
+
+#ifdef WITH_IFCXML
+IFC_PARSE_API IfcFile* parse_ifcxml(const std::string& filename);
+#endif
 
 }
 
@@ -191,9 +270,9 @@ namespace std {
 	template <>
 	struct iterator_traits<IfcParse::IfcFile::type_iterator> {
 		typedef ptrdiff_t difference_type;
-		typedef const IfcSchema::Type::Enum value_type;
-		typedef const IfcSchema::Type::Enum& reference;
-		typedef const IfcSchema::Type::Enum* pointer;
+		typedef const IfcParse::declaration* value_type;
+		typedef const IfcParse::declaration*& reference;
+		typedef const IfcParse::declaration** pointer;
 		typedef std::forward_iterator_tag iterator_category;
 	};
 }

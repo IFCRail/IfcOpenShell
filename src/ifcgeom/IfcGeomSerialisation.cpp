@@ -13,6 +13,8 @@
 #include <TColStd_Array1OfReal.hxx>
 #include <TColStd_Array2OfReal.hxx>
 #include <TColStd_Array1OfInteger.hxx>
+#include <Geom_BezierCurve.hxx>
+#include <Geom_TrimmedCurve.hxx>
 
 #include "IfcGeom.h"
 
@@ -33,9 +35,12 @@ int convert_to_ifc(const TopoDS_Vertex& v, IfcSchema::IfcCartesianPoint*& p, boo
 template <>
 int convert_to_ifc(const TopoDS_Vertex& v, IfcSchema::IfcVertex*& vertex, bool advanced) {
 	IfcSchema::IfcCartesianPoint* p;
-	convert_to_ifc(v, p, advanced);
-	vertex = new IfcSchema::IfcVertexPoint(p);
-	return 1;
+	if (convert_to_ifc(v, p, advanced)) {
+		vertex = new IfcSchema::IfcVertexPoint(p);
+		return 1;
+	} else {
+		return 0;
+	}
 }
 
 template <>
@@ -71,23 +76,29 @@ void opencascade_array_to_vector2(T& t, std::vector< std::vector<U> >& u) {
 	}
 }
 
-#ifdef USE_IFC4
-IfcSchema::IfcKnotType::IfcKnotType opencascade_knotspec_to_ifc(GeomAbs_BSplKnotDistribution bspline_knot_spec) {
-	IfcSchema::IfcKnotType::IfcKnotType knot_spec = IfcSchema::IfcKnotType::IfcKnotType_UNSPECIFIED;
-	if (bspline_knot_spec == GeomAbs_Uniform) {
-		knot_spec = IfcSchema::IfcKnotType::IfcKnotType_UNIFORM_KNOTS;
-	} else if (bspline_knot_spec == GeomAbs_QuasiUniform) {
-		knot_spec = IfcSchema::IfcKnotType::IfcKnotType_QUASI_UNIFORM_KNOTS;
-	} else if (bspline_knot_spec == GeomAbs_PiecewiseBezier) {
-		knot_spec = IfcSchema::IfcKnotType::IfcKnotType_PIECEWISE_BEZIER_KNOTS;
+#ifdef SCHEMA_HAS_IfcRationalBSplineSurfaceWithKnots
+namespace {
+	IfcSchema::IfcKnotType::Value opencascade_knotspec_to_ifc(GeomAbs_BSplKnotDistribution bspline_knot_spec) {
+		IfcSchema::IfcKnotType::Value knot_spec = IfcSchema::IfcKnotType::IfcKnotType_UNSPECIFIED;
+		if (bspline_knot_spec == GeomAbs_Uniform) {
+			knot_spec = IfcSchema::IfcKnotType::IfcKnotType_UNIFORM_KNOTS;
+		} else if (bspline_knot_spec == GeomAbs_QuasiUniform) {
+			knot_spec = IfcSchema::IfcKnotType::IfcKnotType_QUASI_UNIFORM_KNOTS;
+		} else if (bspline_knot_spec == GeomAbs_PiecewiseBezier) {
+			knot_spec = IfcSchema::IfcKnotType::IfcKnotType_PIECEWISE_BEZIER_KNOTS;
+		}
+		return knot_spec;
 	}
-	return knot_spec;
 }
 #endif
 
 template <>
 int convert_to_ifc(const Handle_Geom_Curve& c, IfcSchema::IfcCurve*& curve, bool advanced) {
-	if (c->DynamicType() == STANDARD_TYPE(Geom_Line)) {
+	if (c->DynamicType() == STANDARD_TYPE(Geom_TrimmedCurve)) {
+		Handle_Geom_TrimmedCurve trim = Handle_Geom_TrimmedCurve::DownCast(c);
+		const Handle_Geom_Curve basis = trim->BasisCurve();
+		return convert_to_ifc(basis, curve, advanced);
+	} else if (c->DynamicType() == STANDARD_TYPE(Geom_Line)) {
 		IfcSchema::IfcDirection* d;
 		IfcSchema::IfcCartesianPoint* p;
 
@@ -123,7 +134,53 @@ int convert_to_ifc(const Handle_Geom_Curve& c, IfcSchema::IfcCurve*& curve, bool
 
 		return 1;
 	}
-#ifdef USE_IFC4
+#ifdef SCHEMA_HAS_IfcRationalBSplineSurfaceWithKnots
+	else if (c->DynamicType() == STANDARD_TYPE(Geom_BezierCurve)) {
+		Handle_Geom_BezierCurve bezier = Handle_Geom_BezierCurve::DownCast(c);
+
+		std::vector<int> mults;
+		std::vector<double> knots;
+		std::vector<double> weights;
+
+		IfcSchema::IfcKnotType::Value knot_spec = IfcSchema::IfcKnotType::IfcKnotType_QUASI_UNIFORM_KNOTS;
+
+		IfcSchema::IfcCartesianPoint::list::ptr points(new IfcSchema::IfcCartesianPoint::list);
+		TColgp_Array1OfPnt poles(1, bezier->NbPoles());
+		bezier->Poles(poles);
+		for (int i = 1; i <= bezier->NbPoles(); ++i) {
+			IfcSchema::IfcCartesianPoint* p;
+			if (!convert_to_ifc(poles.Value(i), p, advanced)) {
+				return 0;
+			}
+			points->push(p);
+
+			if (i == 1 || i == bezier->NbPoles()) {
+				mults.push_back(bezier->Degree() + 1);
+			} else {
+				mults.push_back(bezier->Degree());
+			}
+
+			knots.push_back((double) i - 1);
+		}
+
+		TColStd_Array1OfReal bspline_weights(1, bezier->NbPoles());
+		bezier->Weights(bspline_weights);
+		opencascade_array_to_vector(bspline_weights, weights);
+
+		curve = new IfcSchema::IfcRationalBSplineCurveWithKnots(
+			bezier->Degree(),
+			points,
+			IfcSchema::IfcBSplineCurveForm::IfcBSplineCurveForm_UNSPECIFIED,
+			bezier->IsClosed() != 0,
+			false,
+			mults,
+			knots,
+			knot_spec,
+			weights
+		);
+
+		return 1;
+	}
 	else if (c->DynamicType() == STANDARD_TYPE(Geom_BSplineCurve)) {
 		Handle_Geom_BSplineCurve bspline = Handle_Geom_BSplineCurve::DownCast(c);
 
@@ -137,7 +194,7 @@ int convert_to_ifc(const Handle_Geom_Curve& c, IfcSchema::IfcCurve*& curve, bool
 			}
 			points->push(p);
 		}
-		IfcSchema::IfcKnotType::IfcKnotType knot_spec = opencascade_knotspec_to_ifc(bspline->KnotDistribution());
+		IfcSchema::IfcKnotType::Value knot_spec = opencascade_knotspec_to_ifc(bspline->KnotDistribution());
 
 		std::vector<int> mults;
 		std::vector<double> knots;
@@ -206,7 +263,7 @@ int convert_to_ifc(const Handle_Geom_Surface& s, IfcSchema::IfcSurface*& surface
 		surface = new IfcSchema::IfcPlane(place);
 		return 1;
 	}
-#ifdef USE_IFC4
+#ifdef SCHEMA_HAS_IfcRationalBSplineSurfaceWithKnots
 	else if (s->DynamicType() == STANDARD_TYPE(Geom_CylindricalSurface)) {
 		Handle_Geom_CylindricalSurface cyl = Handle_Geom_CylindricalSurface::DownCast(s);
 		IfcSchema::IfcAxis2Placement3D* place;
@@ -237,8 +294,8 @@ int convert_to_ifc(const Handle_Geom_Surface& s, IfcSchema::IfcSurface*& surface
 			points->push(ps);
 		}
 
-		IfcSchema::IfcKnotType::IfcKnotType knot_spec_u = opencascade_knotspec_to_ifc(bspline->UKnotDistribution());
-		IfcSchema::IfcKnotType::IfcKnotType knot_spec_v = opencascade_knotspec_to_ifc(bspline->VKnotDistribution());
+		IfcSchema::IfcKnotType::Value knot_spec_u = opencascade_knotspec_to_ifc(bspline->UKnotDistribution());
+		IfcSchema::IfcKnotType::Value knot_spec_v = opencascade_knotspec_to_ifc(bspline->VKnotDistribution());
 
 		if (knot_spec_u != knot_spec_v) {
 			knot_spec_u = IfcSchema::IfcKnotType::IfcKnotType_UNSPECIFIED;
@@ -376,6 +433,21 @@ int convert_to_ifc(const TopoDS_Edge& e, IfcSchema::IfcEdge*& edge, bool advance
 	}
 }
 
+namespace {
+	bool is_polygonal(const Handle_Geom_Curve& crv) {
+		if (crv->DynamicType() == STANDARD_TYPE(Geom_Line)) {
+			return true;
+		} else if (crv->DynamicType() == STANDARD_TYPE(Geom_TrimmedCurve)) {
+			return is_polygonal(Handle_Geom_TrimmedCurve::DownCast(crv)->BasisCurve());
+		} else if (crv->DynamicType() == STANDARD_TYPE(Geom_BSplineCurve)) {
+			auto bspl = Handle_Geom_BSplineCurve::DownCast(crv);
+			return bspl->NbPoles() == 2 && bspl->Degree() == 1;
+		} else {
+			return false;
+		}
+	}
+}
+
 template <>
 int convert_to_ifc(const TopoDS_Wire& wire, IfcSchema::IfcLoop*& loop, bool advanced) {
 	bool polygonal = true;
@@ -385,7 +457,7 @@ int convert_to_ifc(const TopoDS_Wire& wire, IfcSchema::IfcLoop*& loop, bool adva
 		if (crv.IsNull()) {
 			continue;
 		}
-		if (crv->DynamicType() != STANDARD_TYPE(Geom_Line)) {
+		if (!is_polygonal(crv)) {
 			polygonal = false;
 			break;
 		}
@@ -455,7 +527,7 @@ int convert_to_ifc(const TopoDS_Face& f, IfcSchema::IfcFace*& face, bool advance
 		face = new IfcSchema::IfcFace(bounds);
 		return 1;
 	} else {
-#ifdef USE_IFC4
+#ifdef SCHEMA_HAS_IfcAdvancedFace
 		IfcSchema::IfcSurface* surface;
 		if (!convert_to_ifc(surf, surface, advanced)) {
 			return 0;
@@ -493,8 +565,9 @@ int convert_to_ifc(const TopoDS_Shape& s, U*& item, bool advanced) {
 	return faces->size();
 }
 
-IfcSchema::IfcProductDefinitionShape* IfcGeom::serialise(const TopoDS_Shape& shape, bool advanced) {
-#ifndef USE_IFC4
+IfcUtil::IfcBaseClass* IfcGeom::MAKE_TYPE_NAME(serialise_)(const TopoDS_Shape& shape, bool advanced) {
+
+#ifndef SCHEMA_HAS_IfcAdvancedBrep
 	advanced = false;
 #endif
 
@@ -523,7 +596,7 @@ IfcSchema::IfcProductDefinitionShape* IfcGeom::serialise(const TopoDS_Shape& sha
 			}
 		}
 
-#ifdef USE_IFC4
+#ifdef SCHEMA_HAS_IfcAdvancedBrep
 		if (advanced) {
 			if (inner->size()) {
 				items->push(new IfcSchema::IfcAdvancedBrepWithVoids(outer, inner));
@@ -604,7 +677,7 @@ IfcSchema::IfcProductDefinitionShape* IfcGeom::serialise(const TopoDS_Shape& sha
 	return new IfcSchema::IfcProductDefinitionShape(boost::none, boost::none, reps);
 }
 
-IfcSchema::IfcProductDefinitionShape* IfcGeom::tesselate(const TopoDS_Shape& shape, double deflection) {
+IfcUtil::IfcBaseClass* IfcGeom::MAKE_TYPE_NAME(tesselate_)(const TopoDS_Shape& shape, double deflection) {
 	BRepMesh_IncrementalMesh(shape, deflection);
 
 	IfcSchema::IfcFace::list::ptr faces(new IfcSchema::IfcFace::list);

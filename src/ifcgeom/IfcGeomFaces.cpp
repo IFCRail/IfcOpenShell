@@ -95,25 +95,89 @@
 #include <TopTools_DataMapOfShapeInteger.hxx>
 #include <TopTools_ListIteratorOfListOfShape.hxx>
 
-#ifdef USE_IFC4
+#include <BRepLib_FindSurface.hxx>
+
+#include <ShapeFix_Shape.hxx>
+#include <ShapeExtend_DataMapIteratorOfDataMapOfShapeListOfMsg.hxx>
+#include <Message_ListIteratorOfListOfMsg.hxx>
+#include <ShapeExtend_MsgRegistrator.hxx>
+#include <Message_Msg.hxx>
+
+#include "../ifcgeom/IfcGeom.h"
+
+#ifdef SCHEMA_HAS_IfcBSplineSurfaceWithKnots
 #include <Geom_BSplineSurface.hxx>
 #include <TColgp_Array2OfPnt.hxx>
 #include <TColStd_Array1OfReal.hxx>
 #include <TColStd_Array1OfInteger.hxx>
 #endif
 
-#include "../ifcgeom/IfcGeom.h"
+#define Kernel MAKE_TYPE_NAME(Kernel)
 
-bool IfcGeom::Kernel::convert(const IfcSchema::IfcFace* l, TopoDS_Shape& face) {
-	IfcSchema::IfcFaceBound::list::ptr bounds = l->Bounds();
+namespace {
+	/* Returns whether wire conforms to a polyhedron, i.e. only edges with linear curves*/
+	bool is_polyhedron(const TopoDS_Wire& wire) {
+		double a, b;
+		TopLoc_Location l;
 
-	// Fail on this early as it can cause issues later on
-	if (bounds->size() == 0) {
-		return false;
+		TopoDS_Iterator it(wire, false, false);
+		for (; it.More(); it.Next()) {
+			auto crv = BRep_Tool::Curve(TopoDS::Edge(it.Value()), l, a, b);
+			if (!crv || crv->DynamicType() != STANDARD_TYPE(Geom_Line)) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
-	Handle(Geom_Surface) face_surface;
-	const bool is_face_surface = l->is(IfcSchema::Type::IfcFaceSurface);
+	/* A temporary structure to store the intermediate data for the face conversion */
+	class face_definition {
+	private:
+		Handle(Geom_Surface) surface_;
+		std::vector<TopoDS_Wire> wires_;
+		bool all_outer_;
+	public:
+		face_definition() : surface_(), all_outer_(false) {}
+
+		typedef std::vector<TopoDS_Wire>::const_iterator wire_it;
+		
+		bool& all_outer() {
+			return all_outer_;
+		}
+
+		bool all_outer() const {
+			return all_outer_;
+		}
+
+		Handle(Geom_Surface)& surface() {
+			return surface_;
+		}
+
+		const Handle(Geom_Surface)& surface() const {
+			return surface_;
+		}
+
+		std::vector<TopoDS_Wire>& wires() {
+			return wires_;
+		}
+
+		const TopoDS_Wire& outer_wire() const {
+			return wires_.front();
+		}
+
+		std::pair<wire_it, wire_it> inner_wires() const {
+			return { wires_.begin() + 1, wires_.end() };
+		}
+	};
+}
+
+bool IfcGeom::Kernel::convert(const IfcSchema::IfcFace* l, TopoDS_Shape& result) {
+	IfcSchema::IfcFaceBound::list::ptr bounds = l->Bounds();
+
+	face_definition fd;
+
+	const bool is_face_surface = l->declaration().is(IfcSchema::IfcFaceSurface::Class());
 
 	if (is_face_surface) {
 		IfcSchema::IfcFaceSurface* fs = (IfcSchema::IfcFaceSurface*) l;
@@ -127,7 +191,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcFace* l, TopoDS_Shape& face) {
 		if (!exp.More()) return false;
 
 		TopoDS_Face surface = TopoDS::Face(exp.Current());
-		face_surface = BRep_Tool::Surface(surface);
+		fd.surface() = BRep_Tool::Surface(surface);
 	}
 	
 	const int num_bounds = bounds->size();
@@ -135,7 +199,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcFace* l, TopoDS_Shape& face) {
 
 	for (IfcSchema::IfcFaceBound::list::it it = bounds->begin(); it != bounds->end(); ++it) {
 		IfcSchema::IfcFaceBound* bound = *it;
-		if (bound->is(IfcSchema::Type::IfcFaceOuterBound)) num_outer_bounds ++;
+		if (bound->declaration().is(IfcSchema::IfcFaceOuterBound::Class())) num_outer_bounds ++;
 	}
 
 	// The number of outer bounds should be one according to the schema. Also Open Cascade
@@ -143,239 +207,207 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcFace* l, TopoDS_Shape& face) {
 	// the face will still be processed as long as there are no holes. A compound of faces
 	// is returned in that case.
 	if (num_bounds > 1 && num_outer_bounds > 1 && num_bounds != num_outer_bounds) {
-		Logger::Message(Logger::LOG_ERROR, "Invalid configuration of boundaries for:", l->entity);
+		Logger::Message(Logger::LOG_ERROR, "Invalid configuration of boundaries for:", l);
 		return false;
 	}
 
-	TopoDS_Compound compound;
-	BRep_Builder builder;
 	if (num_outer_bounds > 1) {
-		builder.MakeCompound(compound);
+		Logger::Message(Logger::LOG_WARNING, "Multiple outer boundaries for:", l);
+		fd.all_outer() = true;
 	}
 
 	TopTools_DataMapOfShapeInteger wire_senses;
 	
-	// The builder is initialized on the heap because of the various different moments
-	// of initialization depending on the configuration of surfaces and boundaries.
-	BRepBuilderAPI_MakeFace* mf = 0;
-	
-	bool success = false;
-	int processed = 0;
-
 	for (int process_interior = 0; process_interior <= 1; ++process_interior) {
 		for (IfcSchema::IfcFaceBound::list::it it = bounds->begin(); it != bounds->end(); ++it) {
 			IfcSchema::IfcFaceBound* bound = *it;
 			IfcSchema::IfcLoop* loop = bound->Bound();
-		
+
 			bool same_sense = bound->Orientation();
-			const bool is_interior = 
-				!bound->is(IfcSchema::Type::IfcFaceOuterBound) &&
+			const bool is_interior =
+				!bound->declaration().is(IfcSchema::IfcFaceOuterBound::Class()) &&
 				(num_bounds > 1) &&
 				(num_outer_bounds < num_bounds);
 
 			// The exterior face boundary is processed first
 			if (is_interior == !process_interior) continue;
-		
+
 			TopoDS_Wire wire;
-			if (!convert_wire(loop, wire)) {
-				Logger::Message(Logger::LOG_ERROR, "Failed to process face boundary loop", loop->entity);
-				delete mf;
+			if (faceset_helper_ && loop->as<IfcSchema::IfcPolyLoop>()) {
+				if (!faceset_helper_->wire(loop->as<IfcSchema::IfcPolyLoop>(), wire)) {
+					Logger::Message(Logger::LOG_WARNING, "Face boundary loop not included", loop);
+					continue;
+				}
+			} else if (!convert_wire(loop, wire)) {
+				Logger::Message(Logger::LOG_ERROR, "Failed to process face boundary loop", loop);
 				return false;
 			}
 
-			/*
-			The approach below does not result in a significant speed-up
-			if (loop->is(IfcSchema::Type::IfcPolyLoop) && processed == 0 && face_surface.IsNull()) {
-				IfcSchema::IfcPolyLoop* polyloop = (IfcSchema::IfcPolyLoop*) loop;
-				IfcSchema::IfcCartesianPoint::list::ptr points = polyloop->Polygon();
-
-				if (points->size() == 3) {
-					// Help Open Cascade by finding the plane more efficiently
-					IfcSchema::IfcCartesianPoint::list::it point_iterator = points->begin();
-					gp_Pnt a, b, c;
-					convert(*point_iterator++, a);
-					convert(*point_iterator++, b);
-					convert(*point_iterator++, c);
-					const gp_XYZ ab = (b.XYZ() - a.XYZ());
-					const gp_XYZ ac = (c.XYZ() - a.XYZ());
-					const gp_Vec cross = ab.Crossed(ac);
-					if (cross.SquareMagnitude() > ALMOST_ZERO) {
-						const gp_Dir n = cross;
-						face_surface = new Geom_Plane(a, n);
-					}
-				}
-			}
-			*/
-		
 			if (!same_sense) {
 				wire.Reverse();
 			}
 
 			wire_senses.Bind(wire.Oriented(TopAbs_FORWARD), same_sense ? TopAbs_FORWARD : TopAbs_REVERSED);
-			
-			bool flattened_wire = false;
 
-			if (!mf) {
-			process_wire:
-
-				if (face_surface.IsNull()) {
-					gp_Pln pln;
-					if (count(wire, TopAbs_EDGE) > 128 && approximate_plane_through_wire(wire, pln)) {
-						// tfk: optimization find the underlying surface ourselves since it's going
-						// to be planar in IFC if no explicit surface is given. Should we always do this?
-						mf = new BRepBuilderAPI_MakeFace(pln, wire, true);
-					} else {
-						mf = new BRepBuilderAPI_MakeFace(wire);
-					}
-				} else {
-					/// @todo check necessity of false here
-					mf = new BRepBuilderAPI_MakeFace(face_surface, wire, false); 
-				}				
-
-				/* BRepBuilderAPI_FaceError er = mf->Error();
-				if (er == BRepBuilderAPI_NotPlanar) {
-					ShapeFix_ShapeTolerance FTol;
-					FTol.SetTolerance(wire, getValue(GV_PRECISION), TopAbs_WIRE);
-					delete mf;
-					mf = new BRepBuilderAPI_MakeFace(wire);
-				} */
-
-				if (mf->IsDone()) {
-					TopoDS_Face outer_face_bound = mf->Face();
-
-					// In case of (non-planar) face surface, p-curves need to be computed.
-					// For planar faces, Open Cascade generates p-curves on the fly.
-					if (!face_surface.IsNull() && face_surface->DynamicType() != STANDARD_TYPE(Geom_Plane)) {
-						TopExp_Explorer exp(outer_face_bound, TopAbs_EDGE);
-						for (; exp.More(); exp.Next()) {
-							const TopoDS_Edge& edge = TopoDS::Edge(exp.Current());
-							ShapeFix_Edge fix_edge;
-							fix_edge.FixAddPCurve(edge, outer_face_bound, false, getValue(GV_PRECISION));
-						}
-					}
-					
-					if (BRepCheck_Face(outer_face_bound).OrientationOfWires() == BRepCheck_BadOrientationOfSubshape) {
-						wire.Reverse();
-						same_sense = !same_sense;
-						delete mf;
-						if (face_surface.IsNull()) {
-							mf = new BRepBuilderAPI_MakeFace(wire);
-						} else {
-							mf = new BRepBuilderAPI_MakeFace(face_surface, wire); 
-						}
-						ShapeFix_Face fix(mf->Face());
-						fix.FixOrientation();
-						outer_face_bound = fix.Face();
-					}
-
-					if (num_outer_bounds > 1) {
-						builder.Add(compound, outer_face_bound);
-						delete mf; mf = 0;
-					} else if (num_bounds > 1) {
-						// Reinitialize the builder to the outer face 
-						// bound in order to add holes more robustly.
-						delete mf;
-						// TODO: What about the face_surface?
-						mf = new BRepBuilderAPI_MakeFace(outer_face_bound);
-					} else {
-						face = outer_face_bound;
-						success = true;
-					}
-				} else {
-					const bool non_planar = mf->Error() == BRepBuilderAPI_NotPlanar;
-					delete mf;
-
-					const bool sewing_shells = getValue(GV_MAX_FACES_TO_SEW) > -1;
-
-					if (non_planar && sewing_shells && bounds->size() == 1 && face_surface.IsNull()) {
-						Logger::Message(Logger::LOG_ERROR, "Triangulating face boundary", bound->entity);
-
-						// When creating a solid, flatting the boundary only postpones the issue to
-						// creating a topological manifold out of the individual faces.
-						TopTools_ListOfShape face_list;
-						triangulate_wire(wire, face_list);
-
-						TopoDS_Compound compound;
-						BRep_Builder builder;
-						builder.MakeCompound(compound);
-
-						TopTools_ListIteratorOfListOfShape face_iterator;
-						for (face_iterator.Initialize(face_list); face_iterator.More(); face_iterator.Next()) {
-							builder.Add(compound, face_iterator.Value());
-						}
-
-						face = compound;
-
-						return true;
-					}
-
-					if (!non_planar || flattened_wire || !flatten_wire(wire)) {
-						Logger::Message(Logger::LOG_ERROR, "Failed to process face boundary", bound->entity);
-						return false;
-					} else {
-						Logger::Message(Logger::LOG_ERROR, "Flattening face boundary", bound->entity);
-						flattened_wire = true;
-						goto process_wire;
-					}
-				}
-
-			} else {
-				mf->Add(wire);
-
-				// Same as above:
-				// In case of (non-planar) face surface, p-curves need to be computed.
-				if (BRep_Tool::Surface(mf->Face())->DynamicType() != STANDARD_TYPE(Geom_Plane)) {
-					TopExp_Explorer exp(wire, TopAbs_EDGE);
-					for (; exp.More(); exp.Next()) {
-						const TopoDS_Edge& edge = TopoDS::Edge(exp.Current());
-						ShapeFix_Edge fix_edge;
-						fix_edge.FixAddPCurve(edge, mf->Face(), false, getValue(GV_PRECISION));
-					}
-				}
-			}
-			processed ++;
+			fd.wires().emplace_back(wire);
 		}
 	}
 
-	if (!success) {
-		success = processed == num_bounds;
-		if (success) {
-			if (num_outer_bounds > 1) {
-				face = compound;
+	if (fd.wires().empty()) {
+		Logger::Warning("Face with no boundaries", l);
+		return false;
+	}
+
+	if (fd.surface().IsNull()) {
+		// Use the first wire to find a plane manually for polygonal wires
+		const TopoDS_Wire& wire = fd.wires().front();
+		if (is_polyhedron(wire)) {
+			TopExp_Explorer exp(wire, TopAbs_EDGE);
+			int count = 0;
+			TopoDS_Edge edges[2];
+			for (; exp.More(); exp.Next(), count++) {
+				if (count < 2) {
+					edges[count] = TopoDS::Edge(exp.Current());
+				}
+			}
+
+			if (count == 3) {
+				// Help Open Cascade by finding the plane more efficiently
+				double _, __;
+				Handle(Geom_Line) c1 = Handle(Geom_Line)::DownCast(BRep_Tool::Curve(edges[0], _, __));
+				Handle(Geom_Line) c2 = Handle(Geom_Line)::DownCast(BRep_Tool::Curve(edges[1], _, __));
+
+				const gp_Vec ab = c1->Position().Direction();
+				const gp_Vec ac = c2->Position().Direction();
+				const gp_Vec cross = ab.Crossed(ac);
+
+				if (cross.SquareMagnitude() > ALMOST_ZERO) {
+					const gp_Dir n = cross;
+					fd.surface() = new Geom_Plane(c1->Position().Location(), n);
+				}
 			} else {
-				success = success && mf->IsDone();
-				if (success) {
-					face = mf->Face();
+				gp_Pln pln;
+				if (approximate_plane_through_wire(wire, pln)) {
+					fd.surface() = new Geom_Plane(pln);
+				}
+			}
+		}
+	}	
+
+	if (fd.surface().IsNull()) {
+		// BRepLib_FindSurface is used in case no surface is found or provided
+		
+		const TopoDS_Wire& wire = fd.wires().front();
+
+		BRepLib_FindSurface fs(wire, getValue(GV_PRECISION), true, true);
+		if (fs.Found()) {
+			fd.surface() = fs.Surface();
+			ShapeFix_ShapeTolerance ftol;
+			ftol.SetTolerance(wire, fs.ToleranceReached(), TopAbs_WIRE);
+		}
+	}
+
+	TopTools_ListOfShape face_list;
+
+	if (fd.surface().IsNull()) {
+		// The set of wires is triangulated in case no surface can be found
+		Logger::Message(Logger::LOG_WARNING, "Triangulating face boundaries for face", l);
+
+		if (fd.all_outer()) {
+			for (const auto& w : fd.wires()) {
+				TopTools_ListOfShape fl;
+				triangulate_wire({ w }, fl);
+				face_list.Append(fl);
+			}
+		} else {
+			triangulate_wire(fd.wires(), face_list);			
+		}
+	} else if (!fd.all_outer()) {
+		BRepBuilderAPI_MakeFace mf(fd.surface(), fd.outer_wire());
+		TopoDS_Face f = mf.Face();
+
+		if (mf.IsDone()) {
+			if (std::distance(fd.inner_wires().first, fd.inner_wires().second)) {
+				mf.Init(f);
+
+				for (auto it = fd.inner_wires().first; it != fd.inner_wires().second; ++it) {
+					mf.Add(*it);
 				}
 
-				ShapeFix_Face sfs(TopoDS::Face(face));
-				TopTools_DataMapOfShapeListOfShape wire_map;
-				sfs.FixOrientation(wire_map);
+				face_list.Append(mf.Face());
+			} else {
+				face_list.Append(f);
+			}
+		}		
+	} else {
+		for (const auto& w : fd.wires()) {
+			BRepBuilderAPI_MakeFace mf(fd.surface(), w);
+			if (mf.IsDone()) {
+				face_list.Append(mf.Face());
+			}
+		}
+	}
+
+	if (!fd.surface().IsNull()) {
+		// Some fixes for orientation and p-curves. If we have no surface, it
+		// means the face has been triangulated in which case none of these
+		// fixes are necessary.
+		
+		if (fd.surface()->DynamicType() != STANDARD_TYPE(Geom_Plane)) {
+			// In case of (non-planar) face surface, p-curves need to be computed.
+			// For planar faces, Open Cascade generates p-curves on the fly.
+
+			for (TopTools_ListIteratorOfListOfShape it(face_list); it.More(); it.Next()) {
+				ShapeFix_Shape sfs(it.Value());
+
+				Handle(ShapeExtend_MsgRegistrator) msg;
+				msg = new ShapeExtend_MsgRegistrator;
+				sfs.SetMsgRegistrator(msg);
+
+				sfs.Perform();
+				it.Value() = sfs.Shape();
 				
-				TopoDS_Iterator jt(face, false);
+				ShapeExtend_DataMapIteratorOfDataMapOfShapeListOfMsg jt(msg->MapShape());
 				for (; jt.More(); jt.Next()) {
-					const TopoDS_Wire& w = TopoDS::Wire(jt.Value());
-					// tfk: @todo if wire_map contains w, I would assume wire_senses also contains w,
-					// this is not the case in github issue #405.
-					if (wire_map.IsBound(w) && wire_senses.IsBound(w)) {
-						const TopTools_ListOfShape& shapes = wire_map.Find(w);
-						TopTools_ListIteratorOfListOfShape it(shapes);
-						for (; it.More(); it.Next()) {
-							// Apparently the wire got reversed, so register it with opposite orientation in the map
-							wire_senses.Bind(it.Value(), wire_senses.Find(w) == TopAbs_FORWARD ? TopAbs_REVERSED : TopAbs_FORWARD);
-						}
+					Message_ListIteratorOfListOfMsg kt(jt.Value());
+					for (; kt.More(); kt.Next()) {
+						char* c = new char[kt.Value().Value().LengthOfCString() + 1];
+						kt.Value().Value().ToUTF8CString(c);
+						Logger::Notice(c, l);
+						delete[] c;
 					}
 				}
-				
-				face = TopoDS::Face(sfs.Face());				
-			}
+			}			
 		}
-	}
 
-	if (success) {
-		// If the wires are reversed the face needs to be reversed as well in order
-		// to maintain the counter-clock-wise ordering of the bounding wire's vertices.
-		if (num_bounds == 1 || true) {
+		for (TopTools_ListIteratorOfListOfShape it(face_list); it.More(); it.Next()) {
+			const TopoDS_Face& face = TopoDS::Face(it.Value());
+			
+			ShapeFix_Face sfs(TopoDS::Face(face));
+			TopTools_DataMapOfShapeListOfShape wire_map;
+			sfs.FixOrientation(wire_map);
+
+			TopoDS_Iterator jt(face, false);
+			for (; jt.More(); jt.Next()) {
+				const TopoDS_Wire& w = TopoDS::Wire(jt.Value());
+				// tfk: @todo if wire_map contains w, I would assume wire_senses also contains w,
+				// this is not the case in github issue #405.
+				if (wire_map.IsBound(w) && wire_senses.IsBound(w)) {
+					const TopTools_ListOfShape& shapes = wire_map.Find(w);
+					TopTools_ListIteratorOfListOfShape kt(shapes);
+					for (; kt.More(); kt.Next()) {
+						// Apparently the wire got reversed, so register it with opposite orientation in the map
+						wire_senses.Bind(kt.Value(), wire_senses.Find(w) == TopAbs_FORWARD ? TopAbs_REVERSED : TopAbs_FORWARD);
+					}
+				}
+			}
+
+			it.Value() = sfs.Face();
+		}
+
+		for (TopTools_ListIteratorOfListOfShape it(face_list); it.More(); it.Next()) {
+			TopoDS_Face& face = TopoDS::Face(it.Value());
+
 			bool all_reversed = true;
 			TopoDS_Iterator jt(face, false);
 			for (; jt.More(); jt.Next()) {
@@ -391,8 +423,20 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcFace* l, TopoDS_Shape& face) {
 		}
 	}
 
-	delete mf;
-	return success;
+	if (face_list.Extent() > 1) {
+		TopoDS_Compound compound;
+		BRep_Builder builder;
+		builder.MakeCompound(compound);
+		for (TopTools_ListIteratorOfListOfShape it(face_list); it.More(); it.Next()) {
+			TopoDS_Face& face = TopoDS::Face(it.Value());
+			builder.Add(compound, face);
+		}
+		result = compound;
+	} else {
+		result = face_list.First();
+	}
+
+	return true;
 }
 
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcArbitraryClosedProfileDef* l, TopoDS_Shape& face) {
@@ -403,8 +447,8 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcArbitraryClosedProfileDef* l, 
 
 	assert_closed_wire(wire);
 
-	TopoDS_Face f;
-	bool success = convert_wire_to_face(wire, f);
+	TopoDS_Compound f;
+	bool success = convert_wire_to_faces(wire, f);
 	if (success) {
 		face = f;
 	}
@@ -443,13 +487,13 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcRectangleProfileDef* l, TopoDS
 	const double y = l->YDim() / 2.0f * getValue(GV_LENGTH_UNIT);
 
 	if ( x < ALMOST_ZERO || y < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -466,13 +510,13 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcRoundedRectangleProfileDef* l,
 	const double r = l->RoundingRadius() * getValue(GV_LENGTH_UNIT);
 
 	if ( x < ALMOST_ZERO || y < ALMOST_ZERO || r < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -497,7 +541,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcRectangleHollowProfileDef* l, 
 	const double r2 = fr2 ? l->InnerFilletRadius() * getValue(GV_LENGTH_UNIT) : 0.;
 	
 	if ( x < ALMOST_ZERO || y < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
@@ -506,7 +550,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcRectangleHollowProfileDef* l, 
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -540,26 +584,35 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcRectangleHollowProfileDef* l, 
 }
 
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcTrapeziumProfileDef* l, TopoDS_Shape& face) {
-	const double x1 = l->BottomXDim() / 2.0f * getValue(GV_LENGTH_UNIT);
+	const double x1 = l->BottomXDim() / 2. * getValue(GV_LENGTH_UNIT);
 	const double w = l->TopXDim() * getValue(GV_LENGTH_UNIT);
 	const double dx = l->TopXOffset() * getValue(GV_LENGTH_UNIT);
-	const double y = l->YDim() / 2.0f  * getValue(GV_LENGTH_UNIT);
+	const double y = l->YDim() / 2.  * getValue(GV_LENGTH_UNIT);
+
+	// See: https://forums.buildingsmart.org/t/how-are-the-sides-of-ifctrapeziumprofiledefs-bounding-box-calculated-in-most-implementations/2945/8
+	// The trapezium x center should not be midway of BottomXDim but rather at the center of the overall bounding box.
+	const double x_offset = ((std::min(dx, 0.) + std::max(w + dx, x1 * 2.)) / 2.) - x1;
 
 	if ( x1 < ALMOST_ZERO || w < ALMOST_ZERO || y < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
 		IfcGeom::Kernel::convert(l->Position(), trsf2d);
 	}
 
-	double coords[8] = {-x1,-y, x1,-y, dx+w-x1,y, dx-x1,y};
+	double coords[8] = {
+		-x1 - x_offset, -y,
+		+x1 - x_offset, -y,
+		-x1 + dx + w - x_offset, y,
+		-x1 + dx - x_offset,y
+	};
 	return profile_helper(4,coords,0,0,0,trsf2d,face);
 }
 
@@ -578,7 +631,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcIShapeProfileDef* l, TopoDS_Sh
 	bool doFillet2 = doFillet1;
 	double x2 = x1, dy2 = dy1, f2 = f1;
 
-	if (l->is(IfcSchema::Type::IfcAsymmetricIShapeProfileDef)) {
+	if (l->declaration().is(IfcSchema::IfcAsymmetricIShapeProfileDef::Class())) {
 		IfcSchema::IfcAsymmetricIShapeProfileDef* assym = (IfcSchema::IfcAsymmetricIShapeProfileDef*) l;
 		x2 = assym->TopFlangeWidth() / 2. * getValue(GV_LENGTH_UNIT);
 		doFillet2 = assym->hasTopFlangeFilletRadius();
@@ -591,13 +644,13 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcIShapeProfileDef* l, TopoDS_Sh
 	}	
 
 	if ( x1 < ALMOST_ZERO || x2 < ALMOST_ZERO || y < ALMOST_ZERO || d1 < ALMOST_ZERO || dy1 < ALMOST_ZERO || dy2 < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -630,13 +683,13 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcZShapeProfileDef* l, TopoDS_Sh
 	}
 
 	if ( x == 0.0f || y == 0.0f || dx == 0.0f || dy == 0.0f ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -663,13 +716,13 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcCShapeProfileDef* l, TopoDS_Sh
 	}
 
 	if ( x < ALMOST_ZERO || y < ALMOST_ZERO || d1 < ALMOST_ZERO || d2 < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -702,7 +755,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcLShapeProfileDef* l, TopoDS_Sh
 	}
 
 	if ( x < ALMOST_ZERO || y < ALMOST_ZERO || d < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
@@ -734,7 +787,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcLShapeProfileDef* l, TopoDS_Sh
 		const double det = a1*b2 - a2*b1;
 
 		if (ALMOST_THE_SAME(det, 0.)) {
-			Logger::Message(Logger::LOG_NOTICE, "Legs do not intersect for:",l->entity);
+			Logger::Message(Logger::LOG_NOTICE, "Legs do not intersect for:",l);
 			return false;
 		}
 
@@ -744,7 +797,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcLShapeProfileDef* l, TopoDS_Sh
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -786,13 +839,13 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcUShapeProfileDef* l, TopoDS_Sh
 	}
 
 	if ( x < ALMOST_ZERO || y < ALMOST_ZERO || d1 < ALMOST_ZERO || d2 < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -820,7 +873,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTShapeProfileDef* l, TopoDS_Sh
 	const double webSlope = hasWebSlope ? (l->WebSlope() * getValue(GV_PLANEANGLE_UNIT)) : 0.;
 
 	if ( x < ALMOST_ZERO || y < ALMOST_ZERO || d1 < ALMOST_ZERO || d2 < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 	
@@ -868,7 +921,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTShapeProfileDef* l, TopoDS_Sh
 		const double det = a1*b2 - a2*b1;
 
 		if (ALMOST_THE_SAME(det, 0.)) {
-			Logger::Message(Logger::LOG_NOTICE, "Web and flange do not intersect for:",l->entity);
+			Logger::Message(Logger::LOG_NOTICE, "Web and flange do not intersect for:",l);
 			return false;
 		}
 
@@ -881,7 +934,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTShapeProfileDef* l, TopoDS_Sh
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -897,13 +950,13 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcTShapeProfileDef* l, TopoDS_Sh
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcCircleProfileDef* l, TopoDS_Shape& face) {
 	const double r = l->Radius() * getValue(GV_LENGTH_UNIT);
 	if ( r == 0.0f ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 	
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -924,18 +977,61 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcCircleProfileDef* l, TopoDS_Sh
 	return success;
 }
 
+#ifdef SCHEMA_HAS_IfcCraneRailAShapeProfileDef
+bool IfcGeom::Kernel::convert(const IfcSchema::IfcCraneRailAShapeProfileDef* l, TopoDS_Shape& face) {
+	double oh = l->OverallHeight() * getValue(GV_LENGTH_UNIT);
+	double bw2 = l->BaseWidth2() * getValue(GV_LENGTH_UNIT);
+	double hw = l->HeadWidth() * getValue(GV_LENGTH_UNIT);
+	double hd2 = l->HeadDepth2() * getValue(GV_LENGTH_UNIT);
+	double hd3 = l->HeadDepth3() * getValue(GV_LENGTH_UNIT);
+	double wt = l->WebThickness() * getValue(GV_LENGTH_UNIT);
+	double bw4 = l->BaseWidth4() * getValue(GV_LENGTH_UNIT);
+	double bd1 = l->BaseDepth1() * getValue(GV_LENGTH_UNIT);
+	double bd2 = l->BaseDepth2() * getValue(GV_LENGTH_UNIT);
+	double bd3 = l->BaseDepth3() * getValue(GV_LENGTH_UNIT);
+
+	gp_Trsf2d trsf2d;
+	bool has_position = true;
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
+	has_position = l->hasPosition();
+#endif
+	if (has_position) {
+		IfcGeom::Kernel::convert(l->Position(), trsf2d);
+	}
+
+	double coords[28] = {
+		-hw / 2., +oh / 2.,
+		-hw / 2., +oh / 2. - hd3,
+		-wt / 2., +oh / 2. - hd2,
+		-wt / 2., -oh / 2. + bd2,
+		-bw4 / 2., -oh / 2. + bd3,
+		-bw2 / 2., -oh / 2. + bd1,
+		-bw2 / 2., -oh / 2.,
+		+bw2 / 2., -oh / 2.,
+		+bw2 / 2., -oh / 2. + bd1,
+		+bw4 / 2., -oh / 2. + bd3,
+		+wt / 2., -oh / 2. + bd2,
+		+wt / 2., +oh / 2. - hd2,
+		+hw / 2., +oh / 2. - hd3,
+		+hw / 2., +oh / 2.
+	};
+
+	return profile_helper(14, coords, 0, 0, 0, trsf2d, face);
+}
+#endif
+
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcCircleHollowProfileDef* l, TopoDS_Shape& face) {
 	const double r = l->Radius() * getValue(GV_LENGTH_UNIT);
 	const double t = l->WallThickness() * getValue(GV_LENGTH_UNIT);
 	
 	if ( r == 0.0f || t == 0.0f ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 	
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -965,7 +1061,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcEllipseProfileDef* l, TopoDS_S
 	double ry = l->SemiAxis2() * getValue(GV_LENGTH_UNIT);
 
 	if ( rx < ALMOST_ZERO || ry < ALMOST_ZERO ) {
-		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l->entity);
+		Logger::Message(Logger::LOG_NOTICE,"Skipping zero sized profile:",l);
 		return false;
 	}
 
@@ -973,7 +1069,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcEllipseProfileDef* l, TopoDS_S
 
 	gp_Trsf2d trsf2d;
 	bool has_position = true;
-#ifdef USE_IFC4
+#ifdef SCHEMA_IfcParameterizedProfileDef_Position_IS_OPTIONAL
 	has_position = l->hasPosition();
 #endif
 	if (has_position) {
@@ -1101,7 +1197,7 @@ bool IfcGeom::Kernel::convert(const IfcSchema::IfcPlane* l, TopoDS_Shape& face) 
 	return true;
 }
 
-#ifdef USE_IFC4
+#ifdef SCHEMA_HAS_IfcBSplineSurfaceWithKnots
 
 bool IfcGeom::Kernel::convert(const IfcSchema::IfcBSplineSurfaceWithKnots* l, TopoDS_Shape& face) {
 	boost::shared_ptr< IfcTemplatedEntityListList<IfcSchema::IfcCartesianPoint> > cps = l->ControlPointsList();

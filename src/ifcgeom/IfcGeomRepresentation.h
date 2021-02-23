@@ -27,15 +27,16 @@
 #include <TColgp_Array1OfPnt.hxx>
 #include <TColgp_Array1OfPnt2d.hxx>
 
-#include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
 #include <BRepTools.hxx>
+#include <TopExp_Explorer.hxx>
 
 #include <BRepAdaptor_Curve.hxx>
 #include <GCPnts_QuasiUniformDeflection.hxx>
 #include <Geom_SphericalSurface.hxx>
 
 #include "../ifcgeom/IfcGeomIteratorSettings.h"
-#include "../ifcgeom/IfcGeomMaterial.h"
+#include "../ifcgeom_schema_agnostic/IfcGeomMaterial.h"
 #include "../ifcgeom/IfcRepresentationShapeItem.h"
 
 #include <TopoDS_Compound.hxx>
@@ -74,7 +75,11 @@ namespace IfcGeom {
 			IfcGeom::IfcRepresentationShapeItems::const_iterator end() const { return shapes_.end(); }
 			const IfcGeom::IfcRepresentationShapeItems& shapes() const { return shapes_; }
 			const std::string& id() const { return id_; }
-			TopoDS_Compound as_compound() const;
+			TopoDS_Compound as_compound(bool force_meters = false) const;
+
+			bool calculate_volume(double&) const;
+			bool calculate_surface_area(double&) const;
+			bool calculate_projected_surface_area(const gp_Ax3& ax, double& along_x, double& along_y, double& along_z) const;
 		};
 
 		class IFC_GEOM_API Serialization : public Representation  {
@@ -82,9 +87,11 @@ namespace IfcGeom {
 			std::string id_;
 			std::string brep_data_;
 			std::vector<double> surface_styles_;
+			std::vector<int> surface_style_ids_;
 		public:
 			const std::string& brep_data() const { return brep_data_; }
 			const std::vector<double>& surface_styles() const { return surface_styles_; }
+			const std::vector<int>& surface_style_ids() const { return surface_style_ids_; }
 			Serialization(const BRep& brep);
 			virtual ~Serialization() {}
 			const std::string& id() const { return id_; }
@@ -112,6 +119,7 @@ namespace IfcGeom {
             std::vector<P> uvs_;
 			std::vector<int> _material_ids;
 			std::vector<Material> _materials;
+			size_t weld_offset_;
 			VertexKeyMap welds;
 
 		public:
@@ -125,10 +133,15 @@ namespace IfcGeom {
 			const std::vector<Material>& materials() const { return _materials; }
 
 			Triangulation(const BRep& shape_model)
-					: Representation(shape_model.settings())
-					, id_(shape_model.id())
+				: Representation(shape_model.settings())
+				, id_(shape_model.id())
+				, weld_offset_(0)
 			{
 				for ( IfcGeom::IfcRepresentationShapeItems::const_iterator iit = shape_model.begin(); iit != shape_model.end(); ++ iit ) {
+					
+					// Don't weld vertices that belong to different items to prevent non-manifold situations.
+					weld_offset_ += welds.size();
+					welds.clear();
 
 					int surface_style_id = -1;
 					if (iit->hasStyle()) {
@@ -158,12 +171,9 @@ namespace IfcGeom {
 
 					// Triangulate the shape
 					try {
-						BRepMesh_IncrementalMesh(s, settings().deflection_tolerance());
+						BRepMesh_IncrementalMesh(s, settings().deflection_tolerance(), false, settings().angular_tolerance());
 					} catch(...) {
-
-						// TODO: Catch outside
-						// Logger::Message(Logger::LOG_ERROR,"Failed to triangulate shape:",ifc_file->entityById(_id)->entity);
-						Logger::Message(Logger::LOG_ERROR,"Failed to triangulate shape");
+						Logger::Message(Logger::LOG_ERROR, "Failed to triangulate shape");
 						continue;
 					}
 
@@ -175,8 +185,9 @@ namespace IfcGeom {
 						TopLoc_Location loc;
 						Handle_Poly_Triangulation tri = BRep_Tool::Triangulation(face,loc);
 
-						if ( ! tri.IsNull() ) {
-
+						if (tri.IsNull()) {
+							Logger::Message(Logger::LOG_ERROR, "Triangulation missing for face");
+						} else {
 							// A 3x3 matrix to rotate the vertex normals
 							const gp_Mat rotation_matrix = trsf.VectorialPart();
 			
@@ -206,13 +217,13 @@ namespace IfcGeom {
 									gp_Vec normal_direction;
 									prop.Normal(uv.X(),uv.Y(),p,normal_direction);
 									gp_Vec normal(0., 0., 0.);
-									if (normal_direction.Magnitude() > ALMOST_ZERO) {
+									if (normal_direction.Magnitude() > 1.e-9) {
 										normal = gp_Dir(normal_direction.XYZ() * rotation_matrix);
 									} else {
 										Handle_Geom_Surface surf = BRep_Tool::Surface(face);
 										// Special case the normal at the poles of a spherical surface
 										if (surf->DynamicType() == STANDARD_TYPE(Geom_SphericalSurface)) {
-											if (ALMOST_THE_SAME(fabs(uv.Y()), M_PI / 2.)) {
+											if (fabs(fabs(uv.Y()) - M_PI / 2.) < 1.e-9) {
 												const bool is_top = uv.Y() > 0;
 												const bool is_forward = face.Orientation() == TopAbs_FORWARD;
 												const double z = (is_top == is_forward) ? 1. : -1.;
@@ -281,62 +292,57 @@ namespace IfcGeom {
 							BRepAdaptor_Curve crv(TopoDS::Edge(texp.Current()));
 							GCPnts_QuasiUniformDeflection tessellater(crv, settings().deflection_tolerance());
 							int n = tessellater.NbPoints();
-							int start = (int)_verts.size() / 3;
+							int previous = -1;
+							
 							for (int i = 1; i <= n; ++i) {
 								gp_XYZ p = tessellater.Value(i).XYZ();
 								
-								/*
-								// In case you want direction arrows on your edges
-								double u = tessellater.Parameter(i);
-								gp_XYZ p2, p3;
-								gp_Pnt tmp;
-								gp_Vec tmp2;
-								crv.D1(u, tmp, tmp2);
-								gp_Dir d1, d2, d3, d4;
-								d1 = tmp2;
-								if (texp.Current().Orientation() == TopAbs_REVERSED) {
-									d1 = -d1;
-								}
-								if (fabs(d1.Z()) < 0.5) {
-									d2 = d1.Crossed(gp::DZ());
-								} else {
-									d2 = d1.Crossed(gp::DY());
-								}
-								d3 = d1.XYZ() + d2.XYZ();
-								d4 = d1.XYZ() - d2.XYZ();
-								p2 = p - d3.XYZ() / 10.;
-								p3 = p - d4.XYZ() / 10.;
-								trsf.Transforms(p2);
-								trsf.Transforms(p3);
-								_material_ids.push_back(surface_style_id);
-								_material_ids.push_back(surface_style_id);
-								_verts.push_back(static_cast<P>(p2.X()));
-								_verts.push_back(static_cast<P>(p2.Y()));
-								_verts.push_back(static_cast<P>(p2.Z()));
-								_verts.push_back(static_cast<P>(p3.X()));
-								_verts.push_back(static_cast<P>(p3.Y()));
-								_verts.push_back(static_cast<P>(p3.Z()));
-								*/
+								int current = addVertex(surface_style_id, p);
 
-								trsf.Transforms(p);
-								
-								_material_ids.push_back(surface_style_id);
-
-								_verts.push_back(static_cast<P>(p.X()));
-								_verts.push_back(static_cast<P>(p.Y()));
-								_verts.push_back(static_cast<P>(p.Z()));
-
+								std::vector<std::pair<int, int>> segments;
 								if (i > 1) {
-									_edges.push_back(start + i - 2);
-									_edges.push_back(start + i - 1);
-									// _edges.push_back(start + 3 * (i - 2) + 2);
-									// _edges.push_back(start + 3 * (i - 1) + 2);
+									segments.push_back(std::make_pair(previous, current));
 								}
 
-								// _edges.push_back(start + 3 * (i - 1) + 0);
-								// _edges.push_back(start + 3 * (i - 1) + 2);
-								// _edges.push_back(start + 3 * (i - 1) + 1);
-								// _edges.push_back(start + 3 * (i - 1) + 2);
+								if (settings().get(IfcGeom::IteratorSettings::EDGE_ARROWS)) {
+									// In case you want direction arrows on your edges
+									double u = tessellater.Parameter(i);
+									gp_XYZ p2, p3;
+									gp_Pnt tmp;
+									gp_Vec tmp2;
+									crv.D1(u, tmp, tmp2);
+									gp_Dir d1, d2, d3, d4;
+									d1 = tmp2;
+									if (texp.Current().Orientation() == TopAbs_REVERSED) {
+										d1 = -d1;
+									}
+									if (fabs(d1.Z()) < 0.5) {
+										d2 = d1.Crossed(gp::DZ());
+									} else {
+										d2 = d1.Crossed(gp::DY());
+									}
+									d3 = d1.XYZ() + d2.XYZ();
+									d4 = d1.XYZ() - d2.XYZ();
+									p2 = p - d3.XYZ() / 10.;
+									p3 = p - d4.XYZ() / 10.;
+									trsf.Transforms(p2);
+									trsf.Transforms(p3);
+									trsf.Transforms(p);
+
+									int left = addVertex(surface_style_id, p2);
+									int right = addVertex(surface_style_id, p3);
+
+									segments.push_back(std::make_pair(left, current));
+									segments.push_back(std::make_pair(right, current));
+								}
+
+								for (auto& s : segments) {
+									_edges.push_back(s.first);
+									_edges.push_back(s.second);
+									_material_ids.push_back(surface_style_id);
+								}
+
+								previous = current;
 							}
 						}
 					}
@@ -388,7 +394,7 @@ namespace IfcGeom {
 					const VertexKey key = std::make_pair(material_index, std::make_pair(X, std::make_pair(Y, Z)));
 					typename VertexKeyMap::const_iterator it = welds.find(key);
 					if ( it != welds.end() ) return it->second;
-					i = (int) welds.size();
+					i = (int) welds.size() + weld_offset_;
 					welds[key] = i;
 				}
 				_verts.push_back(X);
