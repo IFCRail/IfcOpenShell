@@ -255,13 +255,13 @@ public:
 		, ifc_planeangle_unit(-1.0)
 		, modelling_precision(0.00001)
 		, dimensionality(1.)
-		, placement_rel_to(nullptr)
-		, faceset_helper_(nullptr)
 		, layerset_first(-1.)
-		, disable_boolean_result(-1.)
 		, no_wire_intersection_check(-1)
 		, no_wire_intersection_tolerance(-1)
 		, precision_factor(10.)
+		, placement_rel_to(nullptr)
+		, faceset_helper_(nullptr)
+		, disable_boolean_result(-1.)
 	{}
 
 	MAKE_TYPE_NAME(Kernel)(const MAKE_TYPE_NAME(Kernel)& other)
@@ -272,10 +272,10 @@ public:
 		, ifc_planeangle_unit(other.ifc_planeangle_unit)
 		, modelling_precision(other.modelling_precision)
 		, dimensionality(other.dimensionality)
-		, placement_rel_to(other.placement_rel_to)
 		// @nb faceset_helper_ always initialized to 0
-		, faceset_helper_(nullptr)
 		, layerset_first(other.layerset_first)
+		, placement_rel_to(other.placement_rel_to)
+		, faceset_helper_(nullptr)
 		, disable_boolean_result(other.disable_boolean_result)
 
 		, offset(other.offset)
@@ -507,10 +507,15 @@ public:
 
 	virtual bool convert_placement(IfcUtil::IfcBaseClass* item, gp_Trsf& trsf) {
 		if (item->as<IfcSchema::IfcObjectPlacement>()) {
-			return convert(item->as<IfcSchema::IfcObjectPlacement>(), trsf);
-		} else {
-			return false;
+			try {
+				return convert(item->as<IfcSchema::IfcObjectPlacement>(), trsf);
+			} catch (std::exception& e) { 
+				Logger::Error(e, item); 
+			} catch (...) { 
+				Logger::Error("Failed processing placement", item); 
+			}
 		}
+		return false;
 	}
 
 };
