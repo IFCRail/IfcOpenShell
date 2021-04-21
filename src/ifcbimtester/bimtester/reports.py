@@ -25,12 +25,12 @@ class ReportGenerator:
             self.generate_feature_report(feature, output_file, meta_data)
 
     def generate_feature_report(self, feature, output_file, meta_data=None):
-        file_name = os.path.basename(feature["location"]).split(":")[0]
+        # file_name = os.path.basename(feature["location"]).split(":")[0]
         data = {
-            "file_name": file_name,
+            # "file_name": file_name,
             "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "name": feature["name"],
-            "description": feature["description"],
+            "description": feature.get("description", ""),
             "is_success": feature["status"] == "passed",
             "scenarios": [],
         }

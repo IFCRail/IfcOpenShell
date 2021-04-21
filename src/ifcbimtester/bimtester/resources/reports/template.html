@@ -33,6 +33,17 @@
 <body>
     <header>
         <h1>Unit Test validation report - {{name}}</h1>
+        <p><strong>{{time}} {{file_name}}</strong></p>
+        <hr>
+        <span class="{{#is_success}}success{{/is_success}}{{^is_success}}failure{{/is_success}}">{{#is_success}}{{_success}}{{/is_success}}{{^is_success}}{{_failure}}{{/is_success}}</span>
+        {{_tests_passed}}: <strong>{{total_passes}} / {{total_steps}}</strong> ({{pass_rate}}%)
+        <br />
+        {{#description}}
+        <p class="description">
+            {{.}}<br />
+        </p>
+        {{/description}}
+        <hr>
     </header>
     <dl class="dl-horizontal">
         {{#meta_data.topic_title}}

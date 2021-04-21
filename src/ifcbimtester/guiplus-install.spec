@@ -1,11 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+import os
+from PyInstaller import HOMEPATH
 block_cipher = None
 
 a = Analysis(['guiplus.py'],
              pathex=[],
              binaries=[],
-             datas=[('D:\\Job\\libraries\\Python\\Python38\\Lib\\site-packages\\shiboken2', 'shiboken2'), ('D:\\Job\\libraries\\Python\\Python38\\Lib\\site-packages\\ifcopenshell', 'ifcopenshell'), ('.\\bimtester\\features', 'features'), 
+             datas=[(os.path.join(HOMEPATH,'shiboken2'), 'shiboken2'), (os.path.join(HOMEPATH,'ifcopenshell'), 'ifcopenshell'), ('.\\bimtester\\features', 'features'), 
              ('.\\bimtester\\resources', 'resources'), ('.\\bimtester\\locale', 'locale'), ('.\\bimtester\\guiplus\\resources', 'guiplus\\resources')],
              hiddenimports=['behave.formatter.pretty','behave.formatter.json','numpy','pyparsing','bimtester.util','bimtester.table','bimtester.run','bimtester.reports','bimtester.clean','bimtester.ifc'],
              hookspath=[],
